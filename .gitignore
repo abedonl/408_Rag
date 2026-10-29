@@ -1,0 +1,50 @@
+# ============================================================
+# 版权红线：真题、教材 PDF、思维导图仅本地使用，禁止进公开仓库
+# ============================================================
+data/raw/
+data/processed/
+data/eval/
+data/index/
+
+# 本地模型缓存（BGE-M3 / reranker，数 GB）
+models/
+.cache/
+
+# 真实密钥
+.env
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# ---- 测试与工具 ----
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# ---- 日志与临时产物 ----
+logs/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# ---- 实验输出 ----
+reports/*.json
+reports/*.csv
+# 逐题原始结果（断点续跑用，可重跑生成，不进仓库）
+reports/*_runs/
+reports/*_runs*/
+!reports/.gitkeep

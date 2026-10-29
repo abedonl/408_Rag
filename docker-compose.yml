@@ -1,0 +1,65 @@
+# 固定镜像 tag，不用 latest —— 保证消融实验可复现。
+# Qdrant 需 >= v1.10 才支持 sparse vector，本项目锁定 v1.20.0。
+#
+# ⚠️ 本机实测 Docker Hub (registry-1.docker.io) 不可达。
+#    首次拉镜像请走国内镜像仓库，见 scripts/pull_images.sh：
+#        bash scripts/pull_images.sh
+#    脚本会从镜像站拉取并打上标准 tag，之后 docker compose up 即可正常使用。
+#
+# 启动：
+#   docker compose up -d
+#   docker compose ps
+# 停止：
+#   docker compose down          # 保留数据卷
+#   docker compose down -v       # 连数据一起删（需重建索引）
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    container_name: cs408-qdrant
+    ports:
+      - "6333:6333"   # REST / Web UI
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      # 16GB 物理内存，与 Neo4j + BGE-M3 + reranker 共存，必须限额
+      QDRANT__STORAGE__PERFORMANCE__MAX_OPTIMIZATION_THREADS: 4
+      QDRANT__SERVICE__ENABLE_TLS: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: cs408-neo4j
+    ports:
+      - "7474:7474"   # HTTP Browser
+      - "7687:7687"   # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    environment:
+      NEO4J_AUTH: neo4j/cs408rag_dev_pw
+      # 16GB 物理内存，堆与页缓存必须显式限额，否则会和 BGE-M3 抢内存
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+      NEO4J_server_memory_pagecache_size: 512m
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_PLUGINS: '["apoc"]'
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  neo4j_data:
+  neo4j_logs:
