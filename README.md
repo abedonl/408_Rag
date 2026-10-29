@@ -280,19 +280,8 @@ bash scripts/start.sh --foreground   # 前台运行，Ctrl+C 一并停
 bash scripts/start.sh --bootstrap    # 数据缺失时先跑完整管道（约 10 分钟）
 ```
 
-**Windows 用户直接双击 `start.bat`**（或 `stop.bat` 停止）。批处理会自动在 PATH
-和常见安装位置查找 Git for Windows 提供的 bash，找不到会给出明确提示。
-
-```cmd
-start.bat                 :: 起界面并打开浏览器
-start.bat --api           :: 同时起 FastAPI
-start.bat --bootstrap     :: 数据缺失时先构建
-stop.bat                  :: 停应用（容器保留）
-stop.bat --all            :: 连容器一起停
-```
-
-> `.bat` 文件必须用 **CRLF 换行 + ASCII**，否则 cmd.exe 会把脚本拆成碎片执行。
-> 这是实测踩过的坑（LF 换行时 `FOREGROUND` 被拆成 `GROUND` 之类）。
+**Windows 用户**：在 Git Bash 里执行上面的 `bash scripts/start.sh`；
+如果没装 Git for Windows，直接按「手动启动」的 `docker compose` + `uv run` 命令走。
 
 脚本会自动完成：检查 uv / Python / `.env` → 启动 Docker Desktop（若未运行）→
 拉起 Qdrant + Neo4j 并等健康检查 → 校验数据完整性 → 启动服务 → 等端口就绪 → 打开浏览器。
