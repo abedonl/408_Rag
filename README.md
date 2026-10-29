@@ -1,5 +1,7 @@
 # 408-RAG
 
+[![ci](https://github.com/abedonl/408_Rag/actions/workflows/ci.yml/badge.svg)](https://github.com/abedonl/408_Rag/actions/workflows/ci.yml)
+
 面向考研 408 的真题检索问答与考点分析系统。
 
 基于 **720 道历年真题（2009–2026）** 与 **6182 个知识点节点**，构建多路混合检索
