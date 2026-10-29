@@ -295,7 +295,7 @@ def to_markdown(
         lines.append("\n**相邻阶段增量（该组件的净贡献）**\n")
         lines.append("| 组件 | ΔRecall@10 | ΔMRR@10 | ΔnDCG@10 | ΔP50 |")
         lines.append("|---|---|---|---|---|")
-        for prev, cur in zip(ablations, ablations[1:]):
+        for prev, cur in zip(ablations, ablations[1:], strict=False):
             lines.append(
                 f"| {cur.stage} 相对 {prev.stage} | "
                 f"{cur.metrics.recall_at.get(10, 0) - prev.metrics.recall_at.get(10, 0):+.4f} | "

@@ -607,6 +607,7 @@ def run(
     paths: Sequence[str] = ("llm_only", "single_turn", "agent"),
     limit: int | None = None,
     sleep_s: float = 0.0,
+    report_only: bool = False,
 ) -> dict[str, Any]:
     ensure_dirs()
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -628,29 +629,52 @@ def run(
     )
 
     all_rows: list[dict[str, Any]] = []
-    if "llm_only" in paths:
-        all_rows += collect_llm_only(
-            items, out_path=RUNS_DIR / "llm_only.jsonl", limit=None, sleep_s=sleep_s
-        )
-    if "single_turn" in paths:
-        all_rows += collect_rag(
-            items, out_path=RUNS_DIR / "single_turn.jsonl", limit=None, sleep_s=sleep_s
-        )
-    if "agent" in paths:
-        all_rows += collect_agent(
-            items, out_path=RUNS_DIR / "agent.jsonl", limit=None, sleep_s=sleep_s
-        )
+    if report_only:
+        by_path: dict[str, dict[str, dict[str, Any]]] = {}
+        for name in ("llm_only", "single_turn", "agent"):
+            p = RUNS_DIR / f"{name}.jsonl"
+            if p.exists():
+                by_path[name] = _load_done(p)
+        if not by_path:
+            raise SystemExit("没有可复用的逐题结果；先跑一次 --paths ...")
+        # 只保留三条路径都做过的题，否则「总体准确率」的分母不同，
+        # 不能直接横向比较；各路径多跑的部分仍留在 jsonl 里。
+        common: set[str] | None = None
+        for rows_map in by_path.values():
+            qids = set(rows_map)
+            common = qids if common is None else (common & qids)
+        common = common or set()
+        all_rows = [
+            row
+            for rows_map in by_path.values()
+            for qid, row in rows_map.items()
+            if qid in common
+        ]
+    else:
+        if "llm_only" in paths:
+            all_rows += collect_llm_only(
+                items, out_path=RUNS_DIR / "llm_only.jsonl", limit=None, sleep_s=sleep_s
+            )
+        if "single_turn" in paths:
+            all_rows += collect_rag(
+                items, out_path=RUNS_DIR / "single_turn.jsonl", limit=None, sleep_s=sleep_s
+            )
+        if "agent" in paths:
+            all_rows += collect_agent(
+                items, out_path=RUNS_DIR / "agent.jsonl", limit=None, sleep_s=sleep_s
+            )
 
     summary = summarize(all_rows)
     pair = paired(all_rows)
     boot = bootstrap_summary(all_rows)
-    md = to_markdown(summary, pair, n_items=len(items), boot=boot)
+    n_items = len({r["qid"] for r in all_rows}) if all_rows else len(items)
+    md = to_markdown(summary, pair, n_items=n_items, boot=boot)
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     (REPORTS_DIR / "agent_eval.md").write_text(md, encoding="utf-8")
     (REPORTS_DIR / "agent_eval.json").write_text(
         json.dumps(
-            {"summary": summary, "paired": pair, "bootstrap": boot, "n_items": len(items)},
+            {"summary": summary, "paired": pair, "bootstrap": boot, "n_items": n_items},
             ensure_ascii=False,
             indent=2,
         ),
@@ -670,10 +694,16 @@ if __name__ == "__main__":
     ap.add_argument("--paths", default="llm_only,single_turn,agent")
     ap.add_argument("--limit", type=int, default=None, help="本次最多跑多少题（三条路径共用同一批题）")
     ap.add_argument("--sleep", type=float, default=0.0, help="每题之间休眠秒数（避开 RPM 限制）")
+    ap.add_argument(
+        "--report-only",
+        action="store_true",
+        help="不调用 LLM，只用已有逐题结果重算报告（endpoint 限流时用）",
+    )
     args = ap.parse_args()
     run(
         per_type=args.per_type,
         paths=args.paths.split(","),
         limit=args.limit,
         sleep_s=args.sleep,
+        report_only=args.report_only,
     )

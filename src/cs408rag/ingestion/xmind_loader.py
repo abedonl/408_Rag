@@ -97,7 +97,7 @@ def _strip_markup(s: str) -> str:
 
 def _iter_children(topic: dict) -> list[dict]:
     kids: list[dict] = []
-    for key, lst in (topic.get("children") or {}).items():
+    for _key, lst in (topic.get("children") or {}).items():
         if isinstance(lst, list):
             kids.extend(x for x in lst if isinstance(x, dict))
     return kids

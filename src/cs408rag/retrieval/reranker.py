@@ -16,8 +16,9 @@ bge-reranker-v2-m3 做 query-document 逐对打分。相比双塔召回，
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 from loguru import logger
@@ -125,7 +126,7 @@ class CrossEncoderReranker:
         if not docs:
             return []
         scores = self.score_pairs(query, docs)
-        results = [RerankResult(index=i, score=s, text=d) for i, (s, d) in enumerate(zip(scores, docs))]
+        results = [RerankResult(index=i, score=s, text=d) for i, (s, d) in enumerate(zip(scores, docs, strict=False))]
         results.sort(key=lambda r: -r.score)
         return results[:top_n] if top_n else results
 

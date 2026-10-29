@@ -163,7 +163,7 @@ def split_text(
 
     # 加重叠：每块头部拼接前一块的尾部
     out = [merged[0]]
-    for prev, cur in zip(merged, merged[1:]):
+    for prev, cur in zip(merged, merged[1:], strict=False):
         tail = prev[-overlap:] if len(prev) > overlap else prev
         out.append(tail + cur)
     return out

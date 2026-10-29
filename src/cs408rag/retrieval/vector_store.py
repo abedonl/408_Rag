@@ -10,8 +10,9 @@ payload 里放 subject / source / chapter_path / year 等元数据，
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 from loguru import logger

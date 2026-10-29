@@ -39,7 +39,7 @@ def _fill_missing_ignored_files(repo_id: str, *, max_rounds: int = 3) -> list[st
     filled: list[str] = []
     for _ in range(max_rounds):
         try:
-            path = snapshot_download(repo_id, local_files_only=True)
+            snapshot_download(repo_id, local_files_only=True)
             # 校验通过
             if filled:
                 logger.info(f"补齐占位文件：{filled}")

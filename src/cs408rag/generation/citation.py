@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
 
 # [1] 【1】 ［1］ 等各种括号形式
 RE_CITATION = re.compile(r"[\[【［]\s*(\d{1,2})\s*[\]】］]")
