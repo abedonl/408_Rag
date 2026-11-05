@@ -8,8 +8,9 @@
 （dense + BGE-M3 sparse + BM25，按题型自适应选路）+ 小节去重 + Agent 编排的问答链路，
 并附带完整的消融实验与考点分析能力。交叉编码器重排经消融验证为负收益，未启用。
 
-> **状态**：一期（检索 + 生成 + 服务 + 消融）与二期（Agent 编排 + 考点分析 + 图表解析）已完成。
-> 二期分层评测结果见「Agent vs 单轮 RAG」一节。
+> **状态**：一期（检索 + 生成 + 服务 + 消融）、二期（Agent 编排 + 考点分析 +
+> 图表解析）、三期（对抗 Plan）均已完成。最新 Agent 三路径评测见
+> 「LLM-only / 单轮 RAG / Agent」。
 
 ---
 
@@ -23,6 +24,7 @@
 | 真题 / 教材 chunk / 知识点 | 720 题（2009–2026）/ 5296 chunk / 6182 节点 |
 | 生产检索（dev 452 题） | Accuracy@10 **0.668**，Recall@10 0.382，P50 **35–49ms** |
 | held-out（2023–2026，99 题） | Accuracy@10 **0.687**，P50 54ms |
+| Agent 三路径（dev 21 题） | 纯 LLM 90.5% / 单轮 85.7% / Agent **95.2%**；空回答 0%（小样本，CI 下界 0） |
 | Agent 对抗 Plan 规则 | 黄金 Plan **0 误报**；6 类注入 **40/40 检出** |
 | 测试 | **135 passed**（数据相关测试需本地题库） |
 
@@ -60,13 +62,17 @@ streamlit run app/streamlit_app.py
 
 **CI**：`.github/workflows/ci.yml` 跑 `ruff` + 不依赖数据/模型的纯函数单测；
 完整评测需要本地 `data/processed` 与 Qdrant，按「快速开始」重建。
-推到 GitHub 后 Actions 会自动跑；本地提交历史已初始化：
 
-```bash
-gh repo create 408-rag --public --source=. --remote=origin --push
-```
+**仓库**：https://github.com/abedonl/408_Rag （已推送；每次 push 自动跑 Actions）
 
 ---
+
+## 阅读顺序
+
+- **想跑起来** → 快速开始（一键脚本 / 手动命令 / 首次构建数据）
+- **想看数字** → 实验数据 → held-out 报告 → 二期 Agent → 三期对抗 Plan
+- **想看为什么** → 检索融合与排序：进一步实验 → 评测口径
+- **想看边界** → 已知问题与优化记录（含负结果和空正文排查）
 
 ## 这个项目解决什么问题
 
@@ -79,194 +85,6 @@ gh repo create 408-rag --public --source=. --remote=origin --push
 一期的三路混合检索解决第 2 点；二期的 Agent 编排解决第 1、3 点：
 计算题交给确定性计算器，图表题做 SVG 拓扑重建，备考咨询只归纳真实真题频次。
 **每一层都有独立评测，包括 Agent 没有赢的那部分。**
-
-## 教材插图
-
-王道正文里有 **1282 张插图（22.1 MB）**，408 的很多概念离开图就讲不清（树的形态、Cache 结构、
-TCP 状态机、流水线时空图）。检索结果必须能把图一起带出来。
-
-**处理链**：
-
-```
-Markdown 里的 <img src="./pictures/xxx.jpg"> + 图注
-   ↓  md_loader 抽取（含 anchor：图前 60 字正文，用于定位它属于哪一段）
-   ↓  chunker 按 anchor/图注把图片挂到**对应的那个 chunk**（不是整节所有 chunk）
-   ↓  chunk payload 存 {image_id, src, caption}
-   ↓  image_index.json 落盘：image_id -> {path, subject, url, bytes}
-   ↓  输出时按 image_id 查索引，返回 /v1/image/{id}
-```
-
-**实测**：1044 张图成功归属到 710 个 chunk；检索 `树的基本术语` 会带出
-`图 5.1 树的树形表示`，`/v1/image/{id}` 返回真实 JPEG。
-
-### 真题解析里的图
-
-除了教材插图，**47 道真题的官方解析里也带内联 SVG**（过程图、资源分配表、
-状态转换图）。其中 7 道属于 held-out 年份，按防泄漏口径不生成索引，
-实际入库 **40 题 / 45 张 SVG**（4.3 MB），落盘 `data/processed/exam_figures/`，
-合并进同一份 `image_index.json`（总计 **1327 张 / 26.5 MB**）。
-
-解析 chunk 的 payload 现在包含：
-
-```json
-{
-  "text": "题干 + 选项 + 解析全文",
-  "meta": {"qid": "2009-02", "answer": "C", "tags": ["入栈出栈序列"]},
-  "images": [{"image_id": "exam-2009-06-1", "caption": "2009-06 解析配图 1"}]
-}
-```
-
-检索命中解析时，`/v1/retrieve` 会返回可直接渲染的 `/v1/image/{id}`。
-实测 `2009-06` 返回 3 张 SVG，`exists=true`。
-
-**几个设计决定**：
-
-- **image_id 带科目前缀**（如 `数据结构-dac856...`）。部分科目图片名是 `2-1-image-007`
-  这类短名，不加前缀跨科目会撞。
-- **图片挂到具体 chunk 而不是整节**。一节常切成 3–5 段，都挂同一批图会让检索结果塞满无关插图。
-- **图片不进 prompt**。LLM 看不到图，硬塞图注会让它臆测图像内容；只把图注作为提示，
-  图片本身给前端渲染。
-- **索引缺失不报错**。`resolve_images` 找不到时返回空 url 而非抛异常 —— 缺图不该阻断检索。
-
-| 接口 | 说明 |
-|---|---|
-| `GET /v1/image/{image_id}` | 返回图片文件 |
-| `GET /v1/images/stats` | 索引概览（1282 张 / 22.1 MB） |
-| 检索/问答响应 | 每条结果带 `images: [{image_id, caption, url, exists}]` |
-
-## 已知问题与优化待办
-
-### ⚠️ 思考模式与空正文（已解决参数写法）
-
-实测 `sensenova-6.8-flash-lite` 默认开启思考，且 reasoning token 可能远超正文：
-不控制时通常 500–1000，图表题长 prompt 可超过 3200，把 `max_tokens` 吃光后
-**`content` 返回空**（`ok=True`、`completion_tokens == max_tokens`），
-比报错更难发现。
-
-正确参数（在 `sensenova-6.8-flash-lite` 上实测）：
-
-| 写法 | 结果 |
-|---|---|
-| `thinking: {"type": "disabled"}` | ✅ 接受；长 prompt 下 reasoning 从 1000+ 降到 ~55，多数题正文正常 |
-| `thinking: "disabled"`（字符串） | ❌ 返回 400 invalid arguments |
-| `output_config: {"effort": "none"}` | ⚠️ 接受，但降思考效果不稳定；与 `thinking` 同传反而更高 |
-| `reasoning_effort: "none"` | ⚠️ 短题有效，长题仍 1000+ |
-| `enable_thinking: False` | ❌ 被忽略 |
-
-`llm.py` 传 `thinking: {"type": "disabled"}`（`LLM_ENABLE_THINKING=1` 时传
-`enabled` + `output_config.effort=high`）。遇到不认该参数的供应商会 400，
-客户端自动去掉参数重试。**换 endpoint 后先验证参数是否生效**，否则会重现空正文。
-
-**仍存在的边界**：少数题会让模型陷入长思考，即使 `thinking=disabled`
-也会把 3200 token 全用于 reasoning、返回空正文（如 2017-13）。
-这类题在评测里如实计为错误，不粉饰。根治办法是换多模态模型或配 VLM。
-
-**备用模型降级**：主模型在「预算翻倍后仍空正文」时，自动切到
-`LLM_BACKUP_MODEL`（当前 `glm-5.2`）重试一次。同一批 20 道 held-out 题 A/B：
-
-| 模型 | 准确率 | 空回答 | 可判题准确率 | 平均延迟 |
-|---|---|---|---|---|
-| `sensenova-6.8-flash-lite`（主） | **80%** | 2 | **88.9%** | 15.8s |
-| `deepseek-v4-flash` | 75% | 2 | 83.3% | **23.9s** |
-| `glm-5.2`（备用） | 75% | **0** | 75.0% | 14.9s |
-| `deepseek-flash` | 70% | 1 | 73.7% | 15.9s |
-
-`deepseek-v4-flash` 虽然能关闭思考，但 RPM 很低（多次 429 退避），
-空回答并没有比 sensenova 少，延迟反而最高，因此不采用。
-主模型准确率最高，备用模型空回答为 0，所以选择「主模型优先、空正文时降级」，
-而不是直接换模型。降级逻辑有单测覆盖。
-
-### ⚠️ 生成侧延迟偏高（未解决，留作优化项）
-
-实测环境：商汤 sensenova 兼容模式 endpoint，模型 `sensenova-6.8-flash-lite`。
-
-| 场景 | 实测 |
-|---|---|
-| 短输出（≈60 token） | 1.5s |
-| 完整问答（≈400–600 token + 2–3k 上下文） | **50–56s** |
-| 流式首字延迟（TTFT） | **14.2s** |
-| 生成速率（长输出） | ≈12 token/s |
-
-**已排除的原因**：
-
-- 不是上下文长度 —— `max_tokens=80` 时即使 prompt 有 2168 token 也只要 1.7s
-- 不是 thinking 模式 —— `enable_thinking=False` 只省 3s（reasoning token 仅 168）
-- 不是冷启动 —— 预热后仍然慢（已加后台预热，避免首个请求额外多等 45s）
-
-结论：是该 endpoint 对长输出的吞吐限制，非代码问题。
-
-**后续优化方向**（按性价比排序）：
-
-1. **优先走流式**。`/v1/query/stream` 已实现 SSE，首字 14s 出来，用户不用干等 50s。
-   前端应默认用流式路径。
-2. **收敛 `max_tokens`**。当前 1200，实测 600–800 已够用，可直接砍掉约一半时间。
-3. **缩短上下文预算**。`build_context(max_chars=6000)` 可降到 3500（top-5 而非 top-8）。
-4. **换更快的模型**。同 endpoint 下有 `qwen3.8-flash` 之外的选项，或换供应商对比。
-5. **语义缓存**。408 问题重复率高（「什么是组相联映射」会被反复问），
-   相同/相似 query 直接命中缓存可省掉整次生成。
-6. **异步任务化**。把长回答改成「先返回检索结果 + 任务 id，前端轮询」，适合批量场景。
-
-### 换模型前先跑基准
-
-不同模型在同一 endpoint 上的 TTFT 差异很大，凭感觉换不靠谱。用现成脚本实测：
-
-```bash
-uv run --no-sync python scripts/bench_models.py --list          # 列出全部可用模型
-uv run --no-sync python scripts/bench_models.py                 # 测默认候选集
-uv run --no-sync python scripts/bench_models.py --models a,b,c  # 测指定模型
-```
-
-脚本对每个模型先用极短请求预热（排除冷启动），再测**首字延迟、总耗时、字/秒、思考块数**，
-最后按「TTFT 占七成权重」给出综合最佳并提示要改哪一行。
-
-为什么以 TTFT 为主而不是总耗时：用户感受到的是「多久开始出字」。
-本项目实测存在「TTFT 随 `max_tokens` 跳变」的现象（50 时 2.9s，150 以上 42s+），
-只看总耗时会掩盖这个差异。
-
-## 与同期开源项目的关系
-
-[guohuiyuan/408-RAG](https://github.com/guohuiyuan/408-RAG) 是同类项目，用朴素 dense-only RAG
-在**自建的 394 道混合题集**（历年选择题 + 王道练习题 + 每日一题 + 生成题，非纯真题）上
-报告准确率 91.62%。
-
-**本项目不与其数字直接对标**——题源口径不同，并列比较是口径混淆。差异如下：
-
-| 维度 | guohuiyuan/408-RAG | 本项目 |
-|---|---|---|
-| 题源 | 394 道混合题 | **720 道纯真题（2009–2026）** |
-| 评测隔离 | 未说明 | **严格年份 hold-out**（见下） |
-| 检索方式 | dense-only | BGE-M3 dense+sparse + BM25，按题型选路，zscore 融合 + 小节去重 |
-| 知识点图谱 | — | Neo4j，6182 节点（用于考点分析，不做通用召回） |
-| 交叉编码器重排 | — | **已评估：负收益（−7.2pp），未启用** |
-| **组件消融实验** | — | 两张实验表 |
-| 图表题处理 | — | 分层降级（SVG 结构重建） |
-| Agent 编排 | — | LangGraph（二期） |
-| 真题考点分析 | — | 可溯源，禁押题 |
-| 请求级 trace | — | ✓ `/v1/trace/{id}` |
-
-核心差异不在「更准」，而在**能说清楚准确率由哪些组件贡献**。
-
-## 评测口径（重要）
-
-真题自带的 `explanation_text` 是**含答案的官方解析**。若全量入索引而评测题又是同一批，
-RAG 检索到解析即可直接抄答案——准确率虚高且属作弊。因此按年份硬隔离：
-
-| 集合 | 年份 | 题数 | 解析是否入索引 | 用途 |
-|---|---|---|---|---|
-| 开发 / 调参集 | 2009–2022 | 560 | 是 | 调试与调参 |
-| **held-out 测试集** | **2023–2026** | **160** | **否** | 仅用于最终报告 |
-
-隔离由 `HOLDOUT_YEARS` 配置与检索层 payload 过滤强制实施。
-
-## 数据来源
-
-| 资源 | 内容 | 来源 |
-|---|---|---|
-| 真题库 | 720 道真题，含 `tags`(226 个考点标签)、官方解析、图表标记 | [Become-ILLUSORY/408-quiz](https://github.com/Become-ILLUSORY/408-quiz) |
-| 教材 | 数据结构 / 组成原理 / 操作系统 / 计算机网络 PDF | [naplatte/CS-Postgraduate-…-408-Database](https://github.com/naplatte/CS-Postgraduate-Entrance-Examination-408-Database) |
-| 知识点图谱 | 4 个 XMind，6182 个知识点节点，深度 10–11 层 | 同上 |
-
-**版权**：真题与教材均有版权，`data/raw/` 已被 `.gitignore` 排除，本仓库不分发语料原文。
 
 ## 快速开始
 
@@ -371,6 +189,60 @@ bash scripts/install_cuda_torch.sh    # 装 CUDA 版 torch（约 10 分钟，2.6
                       二期：Agent 编排层(LangGraph) 编排以上全部
 ```
 
+## 教材插图
+
+王道正文里有 **1282 张插图（22.1 MB）**，408 的很多概念离开图就讲不清（树的形态、Cache 结构、
+TCP 状态机、流水线时空图）。检索结果必须能把图一起带出来。
+
+**处理链**：
+
+```
+Markdown 里的 <img src="./pictures/xxx.jpg"> + 图注
+   ↓  md_loader 抽取（含 anchor：图前 60 字正文，用于定位它属于哪一段）
+   ↓  chunker 按 anchor/图注把图片挂到**对应的那个 chunk**（不是整节所有 chunk）
+   ↓  chunk payload 存 {image_id, src, caption}
+   ↓  image_index.json 落盘：image_id -> {path, subject, url, bytes}
+   ↓  输出时按 image_id 查索引，返回 /v1/image/{id}
+```
+
+**实测**：1044 张图成功归属到 710 个 chunk；检索 `树的基本术语` 会带出
+`图 5.1 树的树形表示`，`/v1/image/{id}` 返回真实 JPEG。
+
+### 真题解析里的图
+
+除了教材插图，**47 道真题的官方解析里也带内联 SVG**（过程图、资源分配表、
+状态转换图）。其中 7 道属于 held-out 年份，按防泄漏口径不生成索引，
+实际入库 **40 题 / 45 张 SVG**（4.3 MB），落盘 `data/processed/exam_figures/`，
+合并进同一份 `image_index.json`（总计 **1327 张 / 26.5 MB**）。
+
+解析 chunk 的 payload 现在包含：
+
+```json
+{
+  "text": "题干 + 选项 + 解析全文",
+  "meta": {"qid": "2009-02", "answer": "C", "tags": ["入栈出栈序列"]},
+  "images": [{"image_id": "exam-2009-06-1", "caption": "2009-06 解析配图 1"}]
+}
+```
+
+检索命中解析时，`/v1/retrieve` 会返回可直接渲染的 `/v1/image/{id}`。
+实测 `2009-06` 返回 3 张 SVG，`exists=true`。
+
+**几个设计决定**：
+
+- **image_id 带科目前缀**（如 `数据结构-dac856...`）。部分科目图片名是 `2-1-image-007`
+  这类短名，不加前缀跨科目会撞。
+- **图片挂到具体 chunk 而不是整节**。一节常切成 3–5 段，都挂同一批图会让检索结果塞满无关插图。
+- **图片不进 prompt**。LLM 看不到图，硬塞图注会让它臆测图像内容；只把图注作为提示，
+  图片本身给前端渲染。
+- **索引缺失不报错**。`resolve_images` 找不到时返回空 url 而非抛异常 —— 缺图不该阻断检索。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /v1/image/{image_id}` | 返回图片文件 |
+| `GET /v1/images/stats` | 索引概览（1282 张 / 22.1 MB） |
+| 检索/问答响应 | 每条结果带 `images: [{image_id, caption, url, exists}]` |
+
 ## 实验数据
 
 全部为真实复现结果。开发集 2009–2022，**452 题**有 ground truth
@@ -465,7 +337,7 @@ bash scripts/install_cuda_torch.sh    # 装 CUDA 版 torch（约 10 分钟，2.6
 
 ### 5. 一个影响巨大的数据发现
 
-语料中 **2966/5856（超过一半）是「本节试题精选」「答案与解析」类小节**，
+语料中**约一半是「本节试题精选」「答案与解析」类小节**，
 它们**逐字收录历年真题原文**。这些 chunk 留在索引里对答标答类问题有用，
 但在检索评测中会让检索器靠题面字面匹配就命中、占满 top-k。
 
@@ -474,6 +346,53 @@ bash scripts/install_cuda_torch.sh    # 装 CUDA 版 torch（约 10 分钟，2.6
 
 因此 chunk 上标注了 `chunk_class`（concept / exercise），
 检索评测时排除 exercise 类；问答服务则保留。这是本项目最重要的一条数据处理经验。
+
+## held-out 检索最终报告（2023–2026，99 题）
+
+held-out 的真题解析**从未入库**，检索时也被 `year_allowed` 二次拦截。
+以下结果只跑过这一次，未用于调参。
+
+| 阶段 | Recall@10 | Accuracy@10 | MRR@10 | P50 |
+|---|---|---|---|---|
+| S0_dense | 0.5017 | 0.6162 | 0.3561 | 46ms |
+| **S1_hybrid** | **0.5402** | 0.6566 | 0.2979 | 86ms |
+| S1b_bm25 | 0.5330 | 0.6465 | 0.2989 | 86ms |
+| S2_rerank | 0.4876 | 0.5960 | 0.3286 | 428ms |
+| **PROD** | 0.3401 | **0.6869** | **0.3673** | **54ms** |
+
+- 混合检索把 Recall@10 从 0.5017 提到 **0.5402**（+3.9pp），题级命中 0.6162→0.6566
+- 交叉编码器重排再次带来 **−4.5pp**，与开发集结论一致
+- **PROD 在 held-out 上题级命中 0.6869、P50 54ms**；chunk 级 Recall 下降是
+  节去重的预期取舍
+- 图谱长尾救援：28 道难题中救回 1 道（**3.6%**）
+- 分科目 Accuracy@10（PROD）：计算机网络 0.864 / 数据结构 0.815 /
+  组成原理 0.630 / 操作系统 0.435
+
+> held-out 只有 99 题有 ground truth，单层样本量小，
+> 以上数字应作为方向性验证而非精确估计。**与 dev 的方向完全一致**，
+> 说明调参没有在 held-out 上过拟合。
+
+### 考点结论质量（20 个高频考点，自动校验）
+
+| 指标 | 结果 | 口径 |
+|---|---|---|
+| **可溯源率** | **100%** | 结论中 97 个真题编号全部真实存在 |
+| **编造真题编号** | **0** | 必须为 0 |
+| **押题表述** | **0** | 必须为 0（命中即拦截） |
+| 频次准确率 | 83.3% | 6 条含频次陈述的结论中 5 条与真实统计一致 |
+| 逐条通过可溯源 | 20/20 | 每条结论的编号均真实存在 |
+
+**一条频次错误如实记录**：考点「异常和中断」真实考查 10 次，模型写成 2 次。
+说明「把统计注入 prompt」还不够 —— 模型仍可能改写数字。改进方向是把
+`claim_eval` 里的数字一致性校验搬到服务层，不达标时拒绝输出或纠正。
+当前自动校验已能发现这类错误，只是尚未接入在线拦截。
+
+**押题扫描的假阳性已修复**：初版用子串匹配「预测」，把
+「不作预测」「不构成对未来考情的任何预测」误判为违规（20 条里误伤 2 条，
+还会给正常回答追加拦截警告）。现在扫描时排除否定语境，修复后 20/20 通过。
+
+人工复核样本（50 条结论的原文、真实频次、引用编号）导出在
+`reports/claim_samples_for_review.json`。
 
 ## 二期：Agent 编排与考点分析
 
@@ -485,34 +404,96 @@ bash scripts/install_cuda_torch.sh    # 装 CUDA 版 torch（约 10 分钟，2.6
 - **图表题**（二叉树形态、流水线时空图、TCP 状态机）：检索只能返回文字，看不懂图
 
 概念题恰恰相反 —— 答案就在某一节教材里，多轮检索只会引入噪声。
-**所以 Agent 不替代检索链路，而是编排它**：一期实测最优的三路 RRF 检索成为
-Agent 手上的一个工具，一期的消融结论因此依然成立。
+**所以 Agent 不替代检索链路，而是编排它**：一期 PROD 混合检索
+（dense+sparse+BM25、zscore、节去重）成为 Agent 手上的一个工具，
+一期的消融结论因此依然成立。
 
 ### 九个工具
 
-| 工具 | 职责 | 数据来源 |
-|---|---|---|
-| `search_knowledge_base` | 复用一期三路 RRF 检索 | Qdrant 5859 chunk |
-| `search_knowledge_graph` | 知识点层级、同节兄弟、章节路径 | Neo4j 6182 节点 |
-| `read_figure` | 分层图解（T1 SVG 重建 → T2 文本 → T3 视觉） | 72 道题的题干 SVG |
-| `calculate` | AST 白名单沙箱求值，禁止任意代码 | — |
-| `get_exam_stats` | 考点频次、年份/科目/题型分布 | 720 真题 tags |
-| `get_kp_questions` | 该考点的历年真题原题 | 720 真题 |
-| `get_related_kps` | 真题共现 + 图谱同节/祖先 | 720 tags + Neo4j |
-| `get_learning_path` | 前置学习链（沿 PREREQUISITE 反向） | Neo4j 148 条前置边 |
-| `verify_answer` | 引用编号、真题编号、押题表述校验 | — |
+| 工具 | 触发条件 | 职责 | 数据来源 |
+|---|---|---|---|
+| `search_knowledge_base` | 所有路线先检索 | 复用一期三路混合检索 | Qdrant 5296 chunk |
+| `search_knowledge_graph` | 概念/跨科目且有关键词 | 知识点层级、同节兄弟、章节路径 | Neo4j 6182 节点 |
+| `read_figure` | `route=figure` 且 qid 有图 | 分层图解（T1 SVG 重建 → T2 文本 → T3 视觉） | 72 道题的题干 SVG |
+| `calculate` | `route=calc` 且模型给出算式 | AST 白名单沙箱求值，禁止任意代码 | — |
+| `get_exam_stats` | `route=exam` 且定位到考点 | 考点频次、年份/科目/题型分布 | 720 真题 tags |
+| `get_kp_questions` | `route=exam` | 该考点的历年真题原题 | 720 真题 |
+| `get_related_kps` | `route=exam` | 真题共现 + 图谱同节/祖先 | 720 tags + Neo4j |
+| `get_learning_path` | `route=exam` 且问「先学/前置」 | 前置学习链（沿 PREREQUISITE 反向） | Neo4j 148 条前置边 |
+| `verify_answer` | 每次回答的最后一步 | 引用编号、真题编号、押题表述校验 | — |
 
 ### 状态机
 
-```
-route ──→ retrieve ──→ assess ──(不足)──→ rewrite ──→ retrieve
-                          │
-                          └──(足够/走工具)──→ act ──→ answer ──→ verify
+```mermaid
+flowchart TD
+    Q[用户问题] --> R{规则路由}
+    R -->|概念 / 跨科目| RET[检索]
+    RET --> AS{检索充分?}
+    AS -->|不足且 < 2 次| RW[查询改写]
+    RW --> RET
+    AS -->|充分| ACT[工具批]
+    R -->|计算 / 图表 / 考点| ACT
+    ACT --> ANS[生成答案]
+    ANS --> V[引用 / 押题校验]
+    V --> OUT[返回 steps / tool_calls / verification]
 ```
 
 `route` 用规则判定（概念 / 计算 / 图表 / 考点咨询），不调 LLM；
 `assess` 最多重试 1 次（共 2 轮检索），计算/图表/考点题直接走 `act`。
 每一步都写入 trace，供 `/v1/agent/query` 与前端展示。
+
+### 一次真实运行：Agent 具体做了什么
+
+不是「LLM 自由决定调什么工具」，而是**规则路由 + 显式工具**。每条 trace 都能回放。
+
+| 问题 | 路由依据 | 工具链 | 结果 |
+|---|---|---|---|
+| 2009-01 概念题 | `route=concept`（默认） | `search_knowledge_base` → `search_knowledge_graph` | **B ✓**，4.9s，引用 [1] |
+| 2014-24「n 台设备不死锁」 | `route=calc`（qid 标注 + 求值问句） | `search_knowledge_base` → `calculate((3-1)+(4-1)+(5-1)+1)` | **B ✓**，计算器=10，7.8s |
+| 2009-04「四棵二叉排序树」 | `route=figure`（qid 含图） | `read_figure` → 拓扑重建 | **B ✓**，结构2 平衡=是 |
+| 「死锁考过几次 / 和什么有关」 | `route=exam`（命中考点词） | `get_exam_stats` → `get_kp_questions` → `get_related_kps` | 6 次 / 4 个标签，引用真题号，0 押题 |
+
+**2014-24 的完整 trace**：
+
+```text
+route    calc        qid 标注计算题；问句是「至少多少台」
+retrieve 4 contexts  教材 / 真题解析
+assess   sufficient=False, should_rewrite=False   # 计算题直接走工具
+act      calculate(expr="(3-1)+(4-1)+(5-1)+1") -> 10
+answer   答案：B
+verify   引用 [1]；无无效真题号；无押题表述
+```
+
+**2009-04 的完整 trace**：
+
+```text
+route    figure      2009-04 标注含图
+act      read_figure(2009-04) -> T1 拓扑
+         A/B/C/D 四棵树；结构2：5 节点、高度 3、平衡=是
+answer   答案：B
+verify   引用 [1]；无押题表述
+```
+
+> 2009-04 是 T1 案例，不计入 21 题配对表；21 题表里只有概念/计算。
+> 两个案例说明工具链在能力边界上有效，但不能用它们替代整体准确率。
+
+**代码在哪里**：
+
+| 文件 | 看什么 |
+|---|---|
+| `agent/graph.py` | route → retrieve → assess → act → answer → verify 的 LangGraph 定义 |
+| `agent/nodes.py` | 规则路由、`_propose_expression`、answer、verify |
+| `agent/tools.py` | 9 个工具的实现与 trace |
+| `agent/exam_analysis.py` | 真题频次 / 题型 / 关联统计 |
+| `eval/agent_eval.py` | LLM-only / 单轮 / Agent 三路径与 bootstrap CI |
+| `app/streamlit_app.py` | 「🤖 Agent 备考助手」tab 展示 steps / tool_calls / verification |
+
+### 为什么不是 ReAct
+
+- 当前 endpoint 长输出约 12 token/s，自由 ReAct 多轮会把延迟推到不可接受；
+- 408 的路线是有限的：概念 / 计算 / 图表 / 考点，规则判定比让模型「想一想」更稳；
+- 每条 trace 可回放、可断言，评测能复现；ReAct 的随机工具选择会让对比失真；
+- 代价是灵活性：规则没覆盖的新意图会落到概念路径，这是有意的取舍。
 
 ### 图表题分层降级（实测 109 道含图题）
 
@@ -583,7 +564,8 @@ T1 只能给结构（树高、连接关系），不能给节点值。需要节�
 - 完整 46 题只跑完 LLM-only（**87.0%**，40/46，空 0）；单轮/Agent 在 20 题后
   被 endpoint 429 截断，没有强行补数。报告文件是三条路径共同的 21 题配对集。
 
-#### 历史：Agent vs 单轮 RAG（25 题，旧配置）
+<details>
+<summary>历史：Agent vs 单轮 RAG（25 题，旧配置）</summary>
 
 > 以下是早期 25 题结果，检索配置为三路含图谱、top-8，且当时空正文未修；
 > 只作为过程记录，不代表当前结论。
@@ -670,6 +652,8 @@ T1 只能给结构（树高、连接关系），不能给节点值。需要节�
 对象写法 `thinking: {"type": "disabled"}` 才生效。上面的评测表就是对象写法下跑出的。
 因此当前结果的瓶颈是 **模型输出稳定性**，不是 Agent 设计。换到能稳定关闭思考、
 且 RPM 足够的模型后重跑同一套评测，才能公平比较。
+
+</details>
 
 ## 三期：对抗性 Plan Agent（生成中实时质疑）
 
@@ -926,53 +910,6 @@ streamlit run app/streamlit_app.py
 7. **结构 Plan 不依赖 LLM**：LLM 只润色 guide；它的失败不会让 Plan 缺失，
    但也不会改变阶段、小时、考点和真题号。
 
-## held-out 检索最终报告（2023–2026，99 题）
-
-held-out 的真题解析**从未入库**，检索时也被 `year_allowed` 二次拦截。
-以下结果只跑过这一次，未用于调参。
-
-| 阶段 | Recall@10 | Accuracy@10 | MRR@10 | P50 |
-|---|---|---|---|---|
-| S0_dense | 0.5017 | 0.6162 | 0.3561 | 46ms |
-| **S1_hybrid** | **0.5402** | 0.6566 | 0.2979 | 86ms |
-| S1b_bm25 | 0.5330 | 0.6465 | 0.2989 | 86ms |
-| S2_rerank | 0.4876 | 0.5960 | 0.3286 | 428ms |
-| **PROD** | 0.3401 | **0.6869** | **0.3673** | **54ms** |
-
-- 混合检索把 Recall@10 从 0.5017 提到 **0.5402**（+3.9pp），题级命中 0.6162→0.6566
-- 交叉编码器重排再次带来 **−4.5pp**，与开发集结论一致
-- **PROD 在 held-out 上题级命中 0.6869、P50 54ms**；chunk 级 Recall 下降是
-  节去重的预期取舍
-- 图谱长尾救援：28 道难题中救回 1 道（**3.6%**）
-- 分科目 Accuracy@10（PROD）：计算机网络 0.864 / 数据结构 0.815 /
-  组成原理 0.630 / 操作系统 0.435
-
-> held-out 只有 99 题有 ground truth，单层样本量小，
-> 以上数字应作为方向性验证而非精确估计。**与 dev 的方向完全一致**，
-> 说明调参没有在 held-out 上过拟合。
-
-### 考点结论质量（20 个高频考点，自动校验）
-
-| 指标 | 结果 | 口径 |
-|---|---|---|
-| **可溯源率** | **100%** | 结论中 97 个真题编号全部真实存在 |
-| **编造真题编号** | **0** | 必须为 0 |
-| **押题表述** | **0** | 必须为 0（命中即拦截） |
-| 频次准确率 | 83.3% | 6 条含频次陈述的结论中 5 条与真实统计一致 |
-| 逐条通过可溯源 | 20/20 | 每条结论的编号均真实存在 |
-
-**一条频次错误如实记录**：考点「异常和中断」真实考查 10 次，模型写成 2 次。
-说明「把统计注入 prompt」还不够 —— 模型仍可能改写数字。改进方向是把
-`claim_eval` 里的数字一致性校验搬到服务层，不达标时拒绝输出或纠正。
-当前自动校验已能发现这类错误，只是尚未接入在线拦截。
-
-**押题扫描的假阳性已修复**：初版用子串匹配「预测」，把
-「不作预测」「不构成对未来考情的任何预测」误判为违规（20 条里误伤 2 条，
-还会给正常回答追加拦截警告）。现在扫描时排除否定语境，修复后 20/20 通过。
-
-人工复核样本（50 条结论的原文、真实频次、引用编号）导出在
-`reports/claim_samples_for_review.json`。
-
 ## 检索融合与排序：进一步实验
 
 dev 452 题（GT 修复后）。这一节记录三组**负结果**，避免后续重复踩坑。
@@ -1220,7 +1157,20 @@ P95 104ms，指标完全不变（R@10 0.5161 / Acc@10 0.5973 / MRR 0.3309）。
 > 修复 prompt 后仍需 3–5 秒，是纯检索的 50–80 倍；精度收益尚未验证，
 > 因此放弃，代码未保留。
 
-## 评测口径说明
+## 评测口径
+
+真题自带的 `explanation_text` 是**含答案的官方解析**。若全量入索引而评测题又是同一批，
+RAG 检索到解析即可直接抄答案——准确率虚高且属作弊。因此按年份硬隔离：
+
+| 集合 | 年份 | 题数 | 解析是否入索引 | 用途 |
+|---|---|---|---|---|
+| 开发 / 调参集 | 2009–2022 | 560 | 是 | 调试与调参 |
+| **held-out 测试集** | **2023–2026** | **160** | **否** | 仅用于最终报告 |
+
+隔离由 `HOLDOUT_YEARS` 配置与检索层 payload 过滤强制实施。
+
+
+### 指标定义、GT 构造与覆盖
 
 - **ground truth 构造链**：题目 `tags` → 知识点标题 → 定位教材小节 → 该节的全部 chunk
   - 只取分数最高的那一个小节（取 2 个会引入噪声）
@@ -1237,6 +1187,132 @@ P95 104ms，指标完全不变（R@10 0.5161 / Acc@10 0.5973 / MRR 0.3309）。
   tag→知识点映射里指向泛化节点的结果——否则「完全二叉树」会被定位到
   「【复习提示】」，检索返回正确小节反而判错。这两处修复让可用题从 365 增至 452，
   指标几乎不变：**污染影响个例判断，不影响均值**。
+
+## 数据来源
+
+| 资源 | 内容 | 来源 |
+|---|---|---|
+| 真题库 | 720 道真题，含 `tags`(226 个考点标签)、官方解析、图表标记 | [Become-ILLUSORY/408-quiz](https://github.com/Become-ILLUSORY/408-quiz) |
+| 教材 | 数据结构 / 组成原理 / 操作系统 / 计算机网络 PDF | [naplatte/CS-Postgraduate-…-408-Database](https://github.com/naplatte/CS-Postgraduate-Entrance-Examination-408-Database) |
+| 知识点图谱 | 4 个 XMind，6182 个知识点节点，深度 10–11 层 | 同上 |
+
+**版权**：真题与教材均有版权，`data/raw/` 已被 `.gitignore` 排除，本仓库不分发语料原文。
+
+## 与同期开源项目的关系
+
+[guohuiyuan/408-RAG](https://github.com/guohuiyuan/408-RAG) 是同类项目，用朴素 dense-only RAG
+在**自建的 394 道混合题集**（历年选择题 + 王道练习题 + 每日一题 + 生成题，非纯真题）上
+报告准确率 91.62%。
+
+**本项目不与其数字直接对标**——题源口径不同，并列比较是口径混淆。差异如下：
+
+| 维度 | guohuiyuan/408-RAG | 本项目 |
+|---|---|---|
+| 题源 | 394 道混合题 | **720 道纯真题（2009–2026）** |
+| 评测隔离 | 未说明 | **严格年份 hold-out**（见下） |
+| 检索方式 | dense-only | BGE-M3 dense+sparse + BM25，按题型选路，zscore 融合 + 小节去重 |
+| 知识点图谱 | — | Neo4j，6182 节点（用于考点分析，不做通用召回） |
+| 交叉编码器重排 | — | **已评估：负收益（−7.2pp），未启用** |
+| **组件消融实验** | — | 两张实验表 |
+| 图表题处理 | — | 分层降级（SVG 结构重建） |
+| Agent 编排 | — | LangGraph（二期） |
+| 真题考点分析 | — | 可溯源，禁押题 |
+| 请求级 trace | — | ✓ `/v1/trace/{id}` |
+
+核心差异不在「更准」，而在**能说清楚准确率由哪些组件贡献**。
+
+## 已知问题与优化记录
+
+### ⚠️ 思考模式与空正文（已解决参数写法）
+
+> **2026-10-29 更新**：选择题 prompt 改为「第一行先写 `答案：X`」、`max_tokens`
+> 提到 3000、空正文时缩短上下文再试一次；dev 21 题配对三条路径空回答均为 **0%**。
+> 下面的思考参数问题仍然适用于新 endpoint，换模型时先验证。
+
+实测 `sensenova-6.8-flash-lite` 默认开启思考，且 reasoning token 可能远超正文：
+不控制时通常 500–1000，图表题长 prompt 可超过 3200，把 `max_tokens` 吃光后
+**`content` 返回空**（`ok=True`、`completion_tokens == max_tokens`），
+比报错更难发现。
+
+正确参数（在 `sensenova-6.8-flash-lite` 上实测）：
+
+| 写法 | 结果 |
+|---|---|
+| `thinking: {"type": "disabled"}` | ✅ 接受；长 prompt 下 reasoning 从 1000+ 降到 ~55，多数题正文正常 |
+| `thinking: "disabled"`（字符串） | ❌ 返回 400 invalid arguments |
+| `output_config: {"effort": "none"}` | ⚠️ 接受，但降思考效果不稳定；与 `thinking` 同传反而更高 |
+| `reasoning_effort: "none"` | ⚠️ 短题有效，长题仍 1000+ |
+| `enable_thinking: False` | ❌ 被忽略 |
+
+`llm.py` 传 `thinking: {"type": "disabled"}`（`LLM_ENABLE_THINKING=1` 时传
+`enabled` + `output_config.effort=high`）。遇到不认该参数的供应商会 400，
+客户端自动去掉参数重试。**换 endpoint 后先验证参数是否生效**，否则会重现空正文。
+
+**仍存在的边界**：少数题会让模型陷入长思考，即使 `thinking=disabled`
+也会把 3200 token 全用于 reasoning、返回空正文（如 2017-13）。
+这类题在评测里如实计为错误，不粉饰。根治办法是换多模态模型或配 VLM。
+
+**备用模型降级**：主模型在「预算翻倍后仍空正文」时，自动切到
+`LLM_BACKUP_MODEL`（当前 `glm-5.2`）重试一次。同一批 20 道 held-out 题 A/B：
+
+| 模型 | 准确率 | 空回答 | 可判题准确率 | 平均延迟 |
+|---|---|---|---|---|
+| `sensenova-6.8-flash-lite`（主） | **80%** | 2 | **88.9%** | 15.8s |
+| `deepseek-v4-flash` | 75% | 2 | 83.3% | **23.9s** |
+| `glm-5.2`（备用） | 75% | **0** | 75.0% | 14.9s |
+| `deepseek-flash` | 70% | 1 | 73.7% | 15.9s |
+
+`deepseek-v4-flash` 虽然能关闭思考，但 RPM 很低（多次 429 退避），
+空回答并没有比 sensenova 少，延迟反而最高，因此不采用。
+主模型准确率最高，备用模型空回答为 0，所以选择「主模型优先、空正文时降级」，
+而不是直接换模型。降级逻辑有单测覆盖。
+
+### ⚠️ 生成侧延迟偏高（未解决，留作优化项）
+
+实测环境：商汤 sensenova 兼容模式 endpoint，模型 `sensenova-6.8-flash-lite`。
+
+| 场景 | 实测 |
+|---|---|
+| 短输出（≈60 token） | 1.5s |
+| 完整问答（≈400–600 token + 2–3k 上下文） | **50–56s** |
+| 流式首字延迟（TTFT） | **14.2s** |
+| 生成速率（长输出） | ≈12 token/s |
+
+**已排除的原因**：
+
+- 不是上下文长度 —— `max_tokens=80` 时即使 prompt 有 2168 token 也只要 1.7s
+- 不是 thinking 模式 —— `enable_thinking=False` 只省 3s（reasoning token 仅 168）
+- 不是冷启动 —— 预热后仍然慢（已加后台预热，避免首个请求额外多等 45s）
+
+结论：是该 endpoint 对长输出的吞吐限制，非代码问题。
+
+**后续优化方向**（按性价比排序）：
+
+1. **优先走流式**。`/v1/query/stream` 已实现 SSE，首字 14s 出来，用户不用干等 50s。
+   前端应默认用流式路径。
+2. **收敛 `max_tokens`**。当前 1200，实测 600–800 已够用，可直接砍掉约一半时间。
+3. **缩短上下文预算**。`build_context(max_chars=6000)` 可降到 3500（top-5 而非 top-8）。
+4. **换更快的模型**。同 endpoint 下有 `qwen3.8-flash` 之外的选项，或换供应商对比。
+5. **语义缓存**。408 问题重复率高（「什么是组相联映射」会被反复问），
+   相同/相似 query 直接命中缓存可省掉整次生成。
+6. **异步任务化**。把长回答改成「先返回检索结果 + 任务 id，前端轮询」，适合批量场景。
+
+### 换模型前先跑基准
+
+不同模型在同一 endpoint 上的 TTFT 差异很大，凭感觉换不靠谱。用现成脚本实测：
+
+```bash
+uv run --no-sync python scripts/bench_models.py --list          # 列出全部可用模型
+uv run --no-sync python scripts/bench_models.py                 # 测默认候选集
+uv run --no-sync python scripts/bench_models.py --models a,b,c  # 测指定模型
+```
+
+脚本对每个模型先用极短请求预热（排除冷启动），再测**首字延迟、总耗时、字/秒、思考块数**，
+最后按「TTFT 占七成权重」给出综合最佳并提示要改哪一行。
+
+为什么以 TTFT 为主而不是总耗时：用户感受到的是「多久开始出字」。
+本项目实测存在「TTFT 随 `max_tokens` 跳变」的现象（50 时 2.9s，150 以上 42s+），
+只看总耗时会掩盖这个差异。
 
 ## 项目结构
 
@@ -1263,4 +1339,9 @@ src/cs408rag/
     ├── tools.py         # 九个工具
     ├── calculator.py    # AST 白名单沙箱
     └── exam_analysis.py # 真题考点统计（多标签聚合）
+
+app/streamlit_app.py     # 6 个 tab：问答 / Agent / 检索调试 / 考点 / 实验数据 / 对抗规划
+tests/                   # 135 个测试；CI 只跑不依赖数据的 10 个纯函数单测
+scripts/                 # start.sh / stop.sh / 模型基准 / 数据与镜像脚本
+.github/workflows/ci.yml # ruff + 纯函数单测
 ```
