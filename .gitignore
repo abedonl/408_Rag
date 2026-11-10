@@ -48,3 +48,13 @@ reports/*.csv
 reports/*_runs/
 reports/*_runs*/
 !reports/.gitkeep
+
+# ---- 本地运行时数据（画像 / 错题本，含个人数据）----
+data/*.db
+data/logs/
+
+# ---- IDE 配置 ----
+.trae/
+
+# ---- 个人文件：简历 ----
+个人简历*.docx

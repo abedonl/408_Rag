@@ -30,6 +30,7 @@ dependencies = [
     "openai>=1.40",
     # --- Agent（二期）---
     "langgraph>=1.2",
+    "simpleeval>=1.0",
     # --- Demo ---
     "streamlit>=1.36",
 ]

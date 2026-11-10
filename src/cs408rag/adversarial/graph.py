@@ -465,15 +465,10 @@ class PlanRunner:
 
     # -- 执行 -------------------------------------------------------------
 
-    def iter_run(self, goal: dict[str, Any]) -> Any:
-        """逐节点产出完整状态快照，供前端实时展示进度。
-
-        流式与一次性执行共用同一张图，避免两条路径产生不同结果。
-        """
-        state = initial_state(goal, use_llm=self.use_llm, max_rounds=self.max_rounds)
+    def _stream(self, state: PlanState) -> Any:
+        """从给定状态跑图，逐节点产出完整快照。流式与一次性执行共用同一张图。"""
         state["started_at"] = time.time()
         last: PlanState = state
-
         with self._lock:
             try:
                 # values 模式每次返回累计后的完整状态，不需要手工合并 reducer
@@ -486,6 +481,32 @@ class PlanRunner:
                 failed["stop_reason"] = "error"
                 failed["error"] = str(e)  # type: ignore[typeddict-unknown-key]
                 yield failed
+
+    def iter_run(self, goal: dict[str, Any]) -> Any:
+        """全新一轮：从初始状态开始。"""
+        state = initial_state(goal, use_llm=self.use_llm, max_rounds=self.max_rounds)
+        return self._stream(state)
+
+    def iter_resume(self, prev: dict[str, Any], challenges: list[dict[str, Any]]) -> Any:
+        """人工裁定后续修一版：以 prev 快照为起点，把采纳的挑战喂回 plan_gen。
+
+        只多修一版：max_rounds 设为上轮 round，修订后的 advance 把 round 推过线即停。
+        prev 只需带 goal/plan/plan_history/version/round/challenge_history——
+        其余字段按新一轮初始化。prev_high 缺省为空：本轮 high 全算新增，
+        恰好避免「人工修订后立刻被判 stalled」。
+        """
+        goal = prev.get("goal") or {}
+        round_no = int(prev.get("round") or 0)
+        state = initial_state(goal, use_llm=self.use_llm, max_rounds=round_no)
+        state["plan"] = prev.get("plan") or {}
+        state["plan_history"] = list(prev.get("plan_history") or [])
+        state["version"] = int(prev.get("version") or 0)
+        state["round"] = round_no
+        # 采纳的挑战保持 open 喂给 planner；被人工忽略（dropped）的带进来，
+        # advance 的 closed 集合会阻止它们被再次提出
+        state["challenges"] = [dict(c) for c in challenges]
+        state["challenge_history"] = [dict(c) for c in prev.get("challenge_history") or []]
+        return self._stream(state)
 
     def run(self, goal: dict[str, Any]) -> PlanResult:
         t0 = time.perf_counter()

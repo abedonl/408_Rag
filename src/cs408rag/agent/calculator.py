@@ -1,42 +1,36 @@
-"""计算器工具。
+"""计算器工具（基于 simpleeval）。
 
 408 计算题（Cache 命中率、页面置换、TCP 拥塞窗口、码距）LLM 心算必错，
 且错得很隐蔽 —— 数字看起来合理但差一位或差一个量级。
 把算式交给确定性求值器，是 Agent 在计算题上真正能带来增益的地方。
 
-安全：只允许白名单 AST 节点，不放行属性访问、下标、赋值、lambda。
-不使用裸 eval 的字符串限制（黑名单永远漏），而是编译后逐节点校验。
+安全边界：
+
+- 求值交给 `simpleeval`，不再自维护 AST 白名单，也不保留 `eval()` 回退。
+  包不可用时 **fail closed**（返回 ok=False），不偷偷降级。
+- 前置检查（长度/字符集/禁用词/属性访问）只是纵深防御，真正拒绝未知名字、
+  函数与语法的是 simpleeval。
+- 幂运算上限压到 10000：默认的 4_000_000 允许 `99999**99999` 这类大整数
+  运算长时间占满 CPU，`9**9**9` 虽然会被拒，但仍不够保守。
 """
 
 from __future__ import annotations
 
-import ast
 import math
 import re
 from typing import Any
 
-_MAX_EXPR_LEN = 500
-_MAX_NODES = 200
+try:  # fail closed：没装包就不求值
+    import simpleeval
 
-_ALLOWED_NODES = (
-    ast.Expression,
-    ast.BinOp,
-    ast.UnaryOp,
-    ast.Constant,
-    ast.Call,
-    ast.Name,
-    ast.Load,
-    ast.Add,
-    ast.Sub,
-    ast.Mult,
-    ast.Div,
-    ast.FloorDiv,
-    ast.Mod,
-    ast.Pow,
-    ast.UAdd,
-    ast.USub,
-    ast.USub,
-)
+    # simpleeval 1.0.x 没有构造函数参数，safe_power 在调用时读模块全局。
+    simpleeval.MAX_POWER = 10_000
+    _IMPORT_ERROR = ""
+except Exception as e:  # noqa: BLE001 - 任何导入失败都按不可用处理
+    simpleeval = None  # type: ignore[assignment]
+    _IMPORT_ERROR = str(e)
+
+_MAX_EXPR_LEN = 500
 
 _FUNCS: dict[str, Any] = {
     "abs": abs,
@@ -55,67 +49,107 @@ _FUNCS: dict[str, Any] = {
     "sin": math.sin,
     "cos": math.cos,
     "tan": math.tan,
-    "pi": math.pi,
-    "e": math.e,
-    "inf": math.inf,
 }
 
-# 408 常用单位换算。LLM 经常把 K=1024 与 K=1000 搞混，
-# 4096 Byte 说成 4*10^3，或把 Mbps 的 M 当成 2^20。
+_NAMES: dict[str, Any] = {"pi": math.pi, "e": math.e}
+
+# 允许的字符集：数字、字母、四则、幂、括号、逗号、空白。
+# 正白名单比黑名单更难漏 —— 字符串、容器、属性、比较、赋值都不在集合里。
+_ALLOWED_CHARS = re.compile(r"^[0-9A-Za-z_+\-*/%().,\s]+$")
+_ATTR_ACCESS = re.compile(r"\.[A-Za-z_]")
+_FORBIDDEN_WORDS = re.compile(
+    r"\b(import|lambda|eval|exec|open|getattr|setattr|globals|locals|compile|"
+    r"__builtins__|system|popen)\b"
+)
+
+# 408 常用单位换算。只做前缀缩放，不擅自把字节换成比特：
+# 4KB -> 4096（Byte），4Kb -> 4096（bit）。是否再 ×8 由使用方决定。
 _UNITS = {
     "K": 1024,
     "M": 1024**2,
     "G": 1024**3,
     "T": 1024**4,
     "k": 1000,
-    "m": 1 / 1000,
 }
 
+RE_UNIT_EXPR = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(K|M|G|T|k)\s*(Byte|bytes|bit|B|b)\b"
+)
 
-def _validate(tree: ast.AST) -> None:
-    nodes = list(ast.walk(tree))
-    if len(nodes) > _MAX_NODES:
-        raise ValueError("表达式过于复杂")
-    for n in nodes:
-        if not isinstance(n, _ALLOWED_NODES):
-            raise ValueError(f"不允许的语法：{type(n).__name__}")
-        if isinstance(n, ast.Call):
-            if not isinstance(n.func, ast.Name) or n.func.id not in _FUNCS:
-                raise ValueError("只允许调用白名单函数")
-        if isinstance(n, ast.Name) and n.id not in _FUNCS:
-            raise ValueError(f"未知标识符：{n.id}")
-        if isinstance(n, ast.Constant) and not isinstance(n.value, (int, float)):
-            raise ValueError("只允许数值常量")
+
+def normalize_expression(expr: str) -> str:
+    """统一全角符号与常见写法，避免 LLM 输出直接触发语法错误。"""
+    return (
+        (expr or "")
+        .strip()
+        .replace("×", "*")
+        .replace("÷", "/")
+        .replace("−", "-")
+        .replace("（", "(")
+        .replace("）", ")")
+        .replace("，", ",")
+        .replace("^", "**")
+    )
+
+
+def validate_expression(expr: str) -> str | None:
+    """前置护栏。返回错误文案；None 表示可以交给 simpleeval。
+
+    这个函数也被 `ToolGuard` 用来在预算/执行之前挡住恶意表达式，
+    所以它不能依赖 simpleeval 的求值行为。
+    """
+    if not expr:
+        return "表达式为空"
+    if len(expr) > _MAX_EXPR_LEN:
+        return "表达式过长"
+    if not _ALLOWED_CHARS.match(expr):
+        return "表达式含不允许的字符"
+    if _ATTR_ACCESS.search(expr):
+        return "不允许属性访问"
+    if _FORBIDDEN_WORDS.search(expr):
+        return "表达式含禁用词"
+    return None
 
 
 def evaluate(expr: str) -> dict[str, Any]:
     """求值一个算式。返回结果与规范化后的表达式。
 
     支持：+ - * / // % ** 括号、0b/0x/0o 字面量、log2/sqrt/ceil 等函数。
-    不支持：变量赋值、字符串、属性访问。
+    不支持：变量赋值、字符串、属性访问、非白名单函数。
     """
-    expr = (expr or "").strip().replace("×", "*").replace("÷", "/").replace("^", "**")
-    if not expr:
-        return {"ok": False, "error": "表达式为空"}
-    if len(expr) > _MAX_EXPR_LEN:
-        return {"ok": False, "error": "表达式过长"}
+    normalized = normalize_expression(expr)
+    expanded = convert_units(normalized)["expr"]
+    problem = validate_expression(expanded)
+    if problem:
+        return {"ok": False, "expr": expanded, "error": problem}
+
+    if simpleeval is None:
+        return {
+            "ok": False,
+            "expr": expanded,
+            "error": f"计算器依赖 simpleeval 不可用：{_IMPORT_ERROR}",
+        }
 
     try:
-        tree = ast.parse(expr, mode="eval")
-        _validate(tree)
-        value = eval(  # noqa: S307 - AST 已白名单校验，globals 为空
-            compile(tree, "<calc>", "eval"),
-            {"__builtins__": {}},
-            _FUNCS,
-        )
+        value = simpleeval.SimpleEval(functions=_FUNCS, names=_NAMES).eval(expanded)
     except ZeroDivisionError:
-        return {"ok": False, "expr": expr, "error": "除零"}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "expr": expr, "error": f"无法计算：{e}"}
+        return {"ok": False, "expr": expanded, "error": "除零"}
+    except OverflowError:
+        return {"ok": False, "expr": expanded, "error": "数值溢出"}
+    except Exception as e:  # noqa: BLE001 - 求值失败统一归一化，不抛给 Agent
+        name = type(e).__name__
+        if "NumberTooHigh" in name or "Power" in str(e):
+            return {"ok": False, "expr": expanded, "error": "幂运算超出安全范围"}
+        return {"ok": False, "expr": expanded, "error": f"无法计算：{str(e)[:200]}"}
+
+    if isinstance(value, complex):
+        return {"ok": False, "expr": expanded, "error": "结果不是实数"}
+    if not isinstance(value, (int, float)):
+        return {"ok": False, "expr": expanded, "error": "结果不是数值"}
 
     return {
         "ok": True,
-        "expr": expr,
+        "expr": expanded,
         "value": value,
         "is_int": isinstance(value, int) or (isinstance(value, float) and value.is_integer()),
         "display": _display(value),
@@ -134,22 +168,19 @@ def _display(v: Any) -> str:
 # 单位换算
 # ---------------------------------------------------------------------------
 
-RE_UNIT_EXPR = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(K|M|G|T|k)\s*(B|Byte|bytes|bit|b)\b", re.I
-)
-
 
 def convert_units(expr: str) -> dict[str, Any]:
-    """把 4KB / 10Mbps 这类写法展开成纯数字表达式。
+    """把 4KB / 10Mb 这类写法按 1024 进制展开成纯数字。
 
-    只处理 408 高频的存储/速率单位，不追求通用。
+    只处理 408 高频的存储/速率前缀，不追求通用。字节与比特保持各自的
+    计数单位，不做隐式 ×8 —— 隐式换算更容易制造「差 8 倍」的错误。
     """
+
     def repl(m: re.Match[str]) -> str:
         num = float(m.group(1))
         prefix = _UNITS[m.group(2)]
-        unit = m.group(3).lower()
-        base = 8 if unit in ("bit", "b") else 1
-        return f"({num * prefix * base})"
+        value = num * prefix
+        return str(int(value)) if value.is_integer() else str(value)
 
     converted = RE_UNIT_EXPR.sub(repl, expr)
     return {"expr": converted, "changed": converted != expr}
@@ -165,8 +196,9 @@ if __name__ == "__main__":
         "log2(4096)",
         "(1 + 2) * 3 / 4",
         "0b1010 + 0x1F",
+        "4KB + 10Mb",
         "__import__('os').system('echo hacked')",
+        "9**9**9",
     ]
     for c in cases:
         print(c, "=>", evaluate(c))
-    print(convert_units("4KB + 10Mbps"))

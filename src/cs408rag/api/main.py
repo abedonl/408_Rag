@@ -7,6 +7,8 @@
     POST /v1/retrieve         只要检索结果（不调 LLM），调试与前端渲染用
     GET  /v1/health
     GET  /v1/trace/{id}       单次请求的完整检索路径与耗时分解
+    GET  /v1/profile          用户画像（提问/作答/规划事件的聚合视图）
+    DELETE /v1/profile        清空画像
 
 工程要点（面试可讲）：
     - **异步 ↔ 同步 GPU 推理的桥接**：BGE-M3 与 reranker 是同步阻塞的，
@@ -16,6 +18,9 @@
     - **请求级 trace**：每次请求分配 request_id，把各阶段耗时、
       三路召回明细、RRF 前后排名变化全存下来，供 /v1/trace 还原。
     - **降级**：LLM 不可用时返回检索结果 + 明确说明，而不是 500。
+    - **画像一致化**：请求带 client_id 时，提问/作答事件写入与 Streamlit
+      同一个 profile.db，两个入口共享一份画像；落库是尽力而为的
+      side-effect，失败只记日志，不拖垮主请求。
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -148,6 +153,9 @@ class QueryRequest(BaseModel):
     subject: str | None = Field(None, description="限定科目，如「数据结构」")
     stage: str = Field("qa", description="检索配置：qa 或 S0_dense/S1_hybrid/…")
     top_n: int = Field(8, ge=1, le=30)
+    client_id: str | None = Field(
+        None, max_length=64, description="匿名身份 ID；给了就把本次提问计入用户画像"
+    )
 
 
 class QuizRequest(BaseModel):
@@ -172,6 +180,21 @@ class AgentRequest(BaseModel):
     subject: str | None = None
     qid: str | None = Field(None, description="真题编号，如 2009-04；给了会启用图形解析")
     mode: str = Field("qa", description="qa 或 quiz")
+    client_id: str | None = Field(
+        None, max_length=64, description="匿名身份 ID；给了就把本次提问计入用户画像"
+    )
+
+
+class ChatRequest(AgentRequest):
+    """多轮对话请求。session_id 缺省时服务端新建会话。
+
+    会话只存内存（LRU 200 + TTL 2h），重启丢历史是明确取舍。
+    profile 目前仅随会话保存（如 {"weak_subjects": ["操作系统"], "target_score": 110}），
+    供 Agent 侧使用，不强行耦合对抗 Plan。
+    """
+
+    session_id: str | None = Field(None, max_length=64)
+    profile: dict[str, Any] | None = None
 
 
 class ContextOut(BaseModel):
@@ -224,10 +247,87 @@ def _resolve_config(stage: str, top_n: int | None = None) -> RetrievalConfig:
     return cfg
 
 
-def _record_trace(rid: str, payload: dict[str, Any]) -> None:
+def _record_trace(rid: str, payload: dict[str, Any], *, source: str = "api") -> None:
     _traces[rid] = payload
     while len(_traces) > TRACE_CAPACITY:
         _traces.popitem(last=False)
+    # 页面不再展示的三路召回 / RRF 排名，落盘留档供 /v1/traces 查询
+    from cs408rag.observability import record_payload
+
+    record_payload(
+        payload,
+        source=source,
+        keys=("request_id", "query", "subject", "took_ms", "trace", "stage", "request"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 用户画像：与 Streamlit 路径同源，写入同一个 profile.db
+# ---------------------------------------------------------------------------
+
+
+def _record_profile_question(
+    client_id: str | None, text: str, *, subject: str | None = None, qid: str | None = None
+) -> None:
+    """提问事件落库（尽力而为）：画像只是增强信号，失败不拖垮主请求。"""
+    if not client_id:
+        return
+    try:
+        from cs408rag.agent.exam_analysis import get_analyzer
+        from cs408rag.profile.stats import extract_tags
+        from cs408rag.profile.store import get_profile_store
+
+        tags = extract_tags(text, get_analyzer())
+        get_profile_store().record(
+            client_id,
+            "question",
+            {"text": text[:200], "subject": subject or "", "qid": qid or "", "tags": tags},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"画像提问事件落库失败：{e}")
+
+
+def _persist_agent_plan(client_id: str | None, res_dict: dict[str, Any]) -> None:
+    """Agent 工具生成的规划落库（仅当显式给了 client_id）。
+
+    规划是独立记录、按身份绑定：不传 client_id 就不写，避免匿名请求
+    互相覆盖同一个 default 规划。
+    """
+    if not client_id:
+        return
+    plan_out = (res_dict.get("tool_outputs") or {}).get("plan_result")
+    if not plan_out:
+        return
+    try:
+        from cs408rag.plan_persistence import persist_plan
+
+        persist_plan(
+            client_id, plan_out, plan_out.get("goal"), stop_reason="agent_chat"
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"规划落库失败：{e}")
+
+
+def _record_profile_quiz(client_id: str, result: dict[str, Any], choice: str) -> None:
+    """作答事件落库：答错考点是画像加权里优先级最高的薄弱信号。"""
+    if not result.get("known"):
+        return
+    try:
+        from cs408rag.profile.store import get_profile_store
+
+        get_profile_store().record(
+            client_id,
+            "quiz",
+            {
+                "qid": result.get("qid", ""),
+                "subject": result.get("subject") or "",
+                "tags": result.get("tags") or [],
+                "correct": bool(result.get("correct")),
+                "choice": choice,
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"画像作答事件落库失败：{e}")
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +420,7 @@ async def query(req: QueryRequest) -> dict[str, Any]:
     res = await run_in_threadpool(
         svc.answer, req.query, subject=req.subject, config=cfg
     )
+    _record_profile_question(req.client_id, req.query, subject=req.subject)
     payload = {"request_id": rid, **res.to_dict()}
     if res.retrieval:
         _record_trace(rid, payload)
@@ -347,10 +448,10 @@ async def quiz(req: QuizRequest) -> dict[str, Any]:
 
 @app.post("/v1/agent/query")
 async def agent_query(req: AgentRequest) -> dict[str, Any]:
-    """Agent 编排入口：route → retrieve → assess → act → answer → verify。
+    """Agent 编排入口：route → retrieve → assess → plan → act → observe → answer → verify。
 
-    返回完整推理链（steps + tool_calls + verification），前端据此展示
-    「用了什么工具、检索了几轮、引用是否可溯源」。
+    返回完整推理链（steps + plan_history + tool_calls + verification），
+    前端据此展示「每轮用了什么工具、为什么、引用是否可溯源」。
     """
     if req.mode not in ("qa", "quiz"):
         raise HTTPException(400, "mode 只能是 qa 或 quiz")
@@ -366,10 +467,151 @@ async def agent_query(req: AgentRequest) -> dict[str, Any]:
         subject=req.subject,
         qid=req.qid,
         mode=req.mode,
+        client_id=req.client_id,
     )
+    _record_profile_question(req.client_id, req.query, subject=req.subject, qid=req.qid)
     payload = {"request_id": rid, **res.to_dict()}
+    _persist_agent_plan(req.client_id, payload)
     _record_trace(rid, payload)
     return payload
+
+
+@app.post("/v1/agent/chat")
+async def agent_chat(req: ChatRequest) -> dict[str, Any]:
+    """多轮对话入口：在 /v1/agent/query 的基础上增加会话记忆与指代消解。
+
+    - 带同一个 session_id 追问（「那 2021 年呢」「这题选什么」）会自动沿用上轮
+      考点/真题；追问被改写时响应里的 `resolved_query` 是实际执行的问题。
+    - 响应新增 `session_id` / `turn_no` / `resolved_query`。
+    """
+    if req.mode not in ("qa", "quiz"):
+        raise HTTPException(400, "mode 只能是 qa 或 quiz")
+
+    rid = uuid.uuid4().hex[:12]
+    runner = _get_runner()
+    res = await run_in_threadpool(
+        runner.run,
+        req.query,
+        options=req.options,
+        subject=req.subject,
+        qid=req.qid,
+        mode=req.mode,
+        session_id=req.session_id or rid,
+        profile=req.profile,
+        client_id=req.client_id,
+    )
+    _record_profile_question(req.client_id, req.query, subject=req.subject, qid=req.qid)
+    payload = {"request_id": rid, **res.to_dict()}
+    _persist_agent_plan(req.client_id, payload)
+    _record_trace(rid, payload)
+    return payload
+
+
+@app.get("/v1/agent/session/{session_id}")
+async def agent_session_get(
+    session_id: str,
+    client_id: str = Query(..., min_length=1, max_length=64),
+) -> dict[str, Any]:
+    """查看会话历史（turns / last_qid / last_topic / summary）。
+
+    必须带 client_id；会话绑定了其他身份时返回 404，避免越权读取。
+    """
+    from cs408rag.agent.memory import get_session_store
+
+    s = await run_in_threadpool(get_session_store().get, session_id)
+    if s is None or (s.client_id and s.client_id != client_id):
+        raise HTTPException(404, "会话不存在或已过期（内存会话 TTL 2h，重启即失效）")
+    return s.to_dict()
+
+
+@app.delete("/v1/agent/session/{session_id}")
+async def agent_session_delete(
+    session_id: str,
+    client_id: str = Query(..., min_length=1, max_length=64),
+) -> dict[str, Any]:
+    """清空会话（「新会话」等价于丢弃旧 session_id）。
+
+    必须带 client_id；会话绑定了其他身份时返回 404，避免越权删除。
+    """
+    from cs408rag.agent.memory import get_session_store
+
+    store = get_session_store()
+    s = await run_in_threadpool(store.get, session_id)
+    if s is None or (s.client_id and s.client_id != client_id):
+        raise HTTPException(404, "会话不存在或已过期")
+    ok = await run_in_threadpool(store.delete, session_id)
+    if not ok:
+        raise HTTPException(404, "会话不存在或已过期")
+    return {"session_id": session_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# 错题本（匿名 client_id + SQLite，答对自动移出）
+# ---------------------------------------------------------------------------
+
+
+class JudgeRequest(BaseModel):
+    client_id: str = Field(min_length=1, max_length=64)
+    qid: str = Field(min_length=1, max_length=32)
+    your_choice: str = Field(min_length=1, max_length=8)
+
+
+@app.post("/v1/notebook/judge")
+async def notebook_judge(req: JudgeRequest) -> dict[str, Any]:
+    """作答判分：对照题库 ground truth，答错记入错题本、答对自动移出。
+
+    qid 不在题库（临时粘贴的题）时返回 known=False，不落库。
+    """
+    from cs408rag.notebook.judge import judge
+
+    choice = req.your_choice.strip().upper()
+    if choice not in ("A", "B", "C", "D"):
+        raise HTTPException(400, "your_choice 只能是 A/B/C/D")
+    res = await run_in_threadpool(judge, req.client_id, req.qid, choice)
+    _record_profile_quiz(req.client_id, res, choice)
+    return res
+
+
+@app.get("/v1/notebook/items")
+async def notebook_items(client_id: str, subject: str | None = None) -> dict[str, Any]:
+    """错题列表，按最近答错时间倒序。"""
+    from cs408rag.notebook.store import get_store
+
+    items = await run_in_threadpool(get_store().list_items, client_id, subject)
+    return {"items": items}
+
+
+@app.delete("/v1/notebook/items/{qid}")
+async def notebook_delete(qid: str, client_id: str) -> dict[str, Any]:
+    """手动移出错题（答对自动移出走 /v1/notebook/judge）。"""
+    from cs408rag.notebook.store import get_store
+
+    ok = await run_in_threadpool(get_store().remove, client_id, qid)
+    return {"qid": qid, "deleted": ok}
+
+
+# ---------------------------------------------------------------------------
+# 用户画像（提问/作答/规划事件的聚合视图，与 Streamlit 侧栏同源）
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/profile")
+async def profile_get(client_id: str) -> dict[str, Any]:
+    """读取画像：高频提问考点、答错考点、最近规划等，供任意前端渲染。"""
+    from cs408rag.profile.stats import build_profile
+    from cs408rag.profile.store import get_profile_store
+
+    events = await run_in_threadpool(get_profile_store().events, client_id)
+    return build_profile(events)
+
+
+@app.delete("/v1/profile")
+async def profile_delete(client_id: str) -> dict[str, Any]:
+    """清空画像：事件全删，不可恢复。"""
+    from cs408rag.profile.store import get_profile_store
+
+    n = await run_in_threadpool(get_profile_store().clear, client_id)
+    return {"client_id": client_id, "cleared": n}
 
 
 @app.get("/v1/exam/overview")
@@ -426,6 +668,7 @@ async def query_stream(req: QueryRequest) -> StreamingResponse:
 
     cfg = _resolve_config(req.stage, top_n=req.top_n)
     svc = _get_service()
+    _record_profile_question(req.client_id, req.query, subject=req.subject)
 
     async def gen():
         # 检索是同步阻塞的，丢进线程池
@@ -472,6 +715,28 @@ async def get_trace(request_id: str) -> dict[str, Any]:
     if not t:
         raise HTTPException(404, f"没有 request_id={request_id} 的记录（环形缓冲容量 {TRACE_CAPACITY}）")
     return t
+
+
+@app.get("/v1/traces")
+async def list_traces(limit: int = 50) -> dict[str, Any]:
+    """落盘的检索留档（最近的在前）。数据来自页面已隐藏的检索调试 / 实验视图。"""
+    from cs408rag.observability import read_traces
+
+    items = read_traces(max(1, min(limit, 500)))
+    return {"count": len(items), "items": items}
+
+
+@app.get("/v1/ablation")
+async def ablation() -> dict[str, Any]:
+    """检索消融结果（页面「实验数据」表已下线，原始 JSON 仍保留在 reports/）。"""
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parents[3] / "reports" / "ablation_dev.json"
+    if not p.exists():
+        raise HTTPException(404, "还没有消融结果：先运行检索消融脚本生成 reports/ablation_dev.json")
+    import json
+
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 @app.get("/v1/stages")

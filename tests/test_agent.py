@@ -58,11 +58,22 @@ class TestCalculator:
         r = evaluate("1/0")
         assert r["ok"] is False
 
+    def test_rejects_huge_power(self):
+        """simpleeval 默认上限 4e6，仍然允许 99999**99999 这类大整数运算；
+        计算器把上限压到 10000，9**9**9 必须直接失败。"""
+        assert evaluate("9**9**9")["ok"] is False
+        assert evaluate("2**10001")["ok"] is False
+
     def test_rejects_too_long(self):
         assert evaluate("1+" * 400 + "1")["ok"] is False
 
     def test_unit_conversion(self):
-        assert "32768" in convert_units("4KB")["expr"]
+        # 只做前缀缩放，不隐式把字节换成比特（旧实现把 4KB 换成 32768 bit，
+        # 会在后续公式里制造「差 8 倍」的错误）。
+        assert convert_units("4KB")["expr"] == "4096"
+        assert convert_units("4Kb")["expr"] == "4096"
+        assert convert_units("1MB")["expr"] == "1048576"
+        assert evaluate("4KB")["value"] == 4096
 
 
 # ---------------------------------------------------------------------------

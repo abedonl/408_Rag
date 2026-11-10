@@ -1,4 +1,4 @@
-"""Agent 的八个工具。
+"""Agent 的九个工具。
 
 设计约束：
 
@@ -19,15 +19,13 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
 from typing import Any
 
-from loguru import logger
-
 from cs408rag.agent.calculator import evaluate
+from cs408rag.agent.contracts import ToolResult, ToolTrace
 from cs408rag.agent.exam_analysis import ExamAnalyzer, get_analyzer
+from cs408rag.agent.guardrails import ToolGuard
 from cs408rag.figures.read_figure import read_figure
 from cs408rag.generation.citation import (
     check_citations,
@@ -35,53 +33,6 @@ from cs408rag.generation.citation import (
     extract_exam_refs,
 )
 from cs408rag.retrieval.pipeline import RetrievalConfig, RetrievalPipeline
-
-
-@dataclass
-class ToolResult:
-    tool: str
-    ok: bool
-    data: Any = None
-    error: str = ""
-    took_ms: float = 0.0
-    summary: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "tool": self.tool,
-            "ok": self.ok,
-            "data": self.data,
-            "error": self.error,
-            "took_ms": round(self.took_ms, 1),
-            "summary": self.summary,
-        }
-
-
-@dataclass
-class ToolTrace:
-    calls: list[ToolResult] = field(default_factory=list)
-
-    def add(self, r: ToolResult) -> ToolResult:
-        self.calls.append(r)
-        return r
-
-    @property
-    def n_calls(self) -> int:
-        return len(self.calls)
-
-    @property
-    def failures(self) -> int:
-        return sum(1 for c in self.calls if not c.ok)
-
-    def by_name(self) -> dict[str, int]:
-        out: dict[str, int] = {}
-        for c in self.calls:
-            out[c.tool] = out.get(c.tool, 0) + 1
-        return out
-
-    def to_list(self) -> list[dict[str, Any]]:
-        return [c.to_dict() for c in self.calls]
-
 
 # ---------------------------------------------------------------------------
 # 默认检索配置：一期实测最优（三路 RRF，不重排）
@@ -126,8 +77,13 @@ class AgentTools:
         self.config = config or AGENT_RETRIEVAL_CONFIG
         self.valid_exam_refs = valid_exam_refs
         self.current_qid: str | None = None
+        # 写操作（打卡/判分）与画像读取的命名空间。由调用方在 run 前绑定，
+        # LLM 无法通过参数指定别人 —— 四个新工具的参数模型里都没有 client_id。
+        self.client_id = "default"
         self.trace = ToolTrace()
         self.failures: dict[str, int] = {}
+        # 所有调用都经过护栏：白名单、参数契约、预算、超时与审计。
+        self.guard = ToolGuard(self)
 
     # -- 懒加载 -----------------------------------------------------------
 
@@ -155,6 +111,10 @@ class AgentTools:
         """标记当前正在作答的题，评测模式下用于排除自身。"""
         self.current_qid = qid
 
+    def set_client(self, client_id: str | None) -> None:
+        """绑定当前用户。reset() 不清它 —— 用户身份跨轮次不变。"""
+        self.client_id = (client_id or "").strip() or "default"
+
     def reset(self, *, current_qid: str | None = None) -> None:
         """开始新的一次 Agent 运行前清空 trace。
 
@@ -163,36 +123,34 @@ class AgentTools:
         """
         self.trace = ToolTrace()
         self.failures = {}
+        # 只清轮次预算；每分钟窗口跨请求保留，否则连续请求可绕过限流。
+        self.guard.reset_round()
         self.current_qid = current_qid
 
     # -- 统一调用入口 -----------------------------------------------------
 
-    def call(self, name: str, **kwargs: Any) -> ToolResult:
-        fn = TOOL_REGISTRY.get(name)
-        if fn is None:
-            return self.trace.add(
-                ToolResult(tool=name, ok=False, error=f"未知工具 {name!r}")
-            )
-        t0 = time.perf_counter()
-        try:
-            data, summary = fn(self, **kwargs)
-            res = ToolResult(
-                tool=name,
-                ok=True,
-                data=data,
-                summary=summary,
-                took_ms=(time.perf_counter() - t0) * 1000,
-            )
-        except Exception as e:  # noqa: BLE001 - 工具失败降级，不阻断 Agent
-            self.failures[name] = self.failures.get(name, 0) + 1
-            logger.warning(f"工具 {name} 失败：{e}")
-            res = ToolResult(
-                tool=name,
-                ok=False,
-                error=str(e)[:300],
-                took_ms=(time.perf_counter() - t0) * 1000,
-            )
-        return self.trace.add(res)
+    def call(
+        self,
+        name: str,
+        *,
+        round_no: int | None = None,
+        count_budget: bool = True,
+        **kwargs: Any,
+    ) -> ToolResult:
+        """经护栏调用工具。
+
+        `count_budget=False` 用于 retrieve 节点内部的检索调用：它们同样
+        需要参数校验与审计，但不占用 planner 的单轮工具预算，
+        否则 3 条查询 × 2 次重试就能把 6 次预算吃光。
+        """
+        return self.guard.call(
+            name, round_no=round_no, count_budget=count_budget, **kwargs
+        )
+
+    def _execute(self, name: str, args: dict[str, Any]) -> tuple[Any, str]:
+        """真正执行工具。只允许护栏调用，不对外暴露。"""
+        fn = TOOL_REGISTRY[name]
+        return fn(self, **args)
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +312,193 @@ def _get_learning_path(self: AgentTools, kp_name: str) -> tuple[Any, str]:
     return path, f"前置链 {len(chain)} 个节点，深度 {path.get('depth', 0)}"
 
 
+# ---------------------------------------------------------------------------
+# 中枢工具：规划 / 画像 / 打卡 / 判分。
+# 这四个工具把「规划看板」与「画像闭环」接进 Agent 聊天入口：
+# 规划与画像是只读计算；打卡与判分是写操作（契约里 idempotent=False）。
+# ---------------------------------------------------------------------------
+
+
+def _profile_view(self: AgentTools) -> dict[str, Any]:
+    from cs408rag.profile.stats import build_profile
+    from cs408rag.profile.store import get_profile_store
+
+    return build_profile(get_profile_store().events(self.client_id))
+
+
+def _generate_plan(
+    self: AgentTools,
+    weak_subjects: list[str] | None = None,
+    progress: dict[str, str] | None = None,
+    daily_hours: int = 4,
+    study_days_per_week: int = 6,
+    target_score: int = 110,
+    concerns: list[str] | None = None,
+) -> tuple[Any, str]:
+    from cs408rag.adversarial.planner import (
+        PROGRESS_LEVELS,
+        SUBJECTS,
+        build_detailed_plan,
+    )
+
+    prof = _profile_view(self)
+    weak = [s for s in (weak_subjects or []) if s in SUBJECTS]
+    weak_from_profile = False
+    if not weak:
+        # 没指定薄弱科目时，从画像里答错最多的科目推断 —— 规划自动吃画像
+        wrong_subj = (prof.get("quiz") or {}).get("wrong_subjects") or {}
+        weak = list(wrong_subj)[:2]
+        weak_from_profile = bool(weak)
+    prog = {s: "未开始" for s in SUBJECTS}
+    prog.update(
+        {
+            s: str(p)
+            for s, p in (progress or {}).items()
+            if s in SUBJECTS and str(p) in PROGRESS_LEVELS
+        }
+    )
+    goal = {
+        "weak_subjects": weak,
+        "progress": prog,
+        "daily_hours": daily_hours,
+        "study_days_per_week": study_days_per_week,
+        "target_score": target_score,
+        "concerns": [str(c)[:100] for c in (concerns or [])],
+        "profile_tags": prof.get("boost_tags") or [],
+    }
+    plan = build_detailed_plan(goal, analyzer=self.analyzer)
+    g = plan["goal"]
+    # 回传完整 plan + 摘要：摘要供 LLM 组织回答，完整 plan 供 UI 直接渲染看板
+    data = {
+        # 完整 plan 一并回传：UI 直接用它渲染看板，不再按 goal 重跑一次 PlanRunner
+        "plan": plan,
+        "goal": goal,
+        "weeks": g["remaining_weeks"],
+        "start_date": g["start_date"],
+        "exam_date": g["exam_date"],
+        "total_hours": g["total_hours"],
+        "daily_hours": g["daily_hours"],
+        "target_score": target_score,
+        "weak_subjects": weak,
+        "weak_from_profile": weak_from_profile,
+        "boosted_by_profile": [
+            t["tag"] for t in (prof.get("boost_tags") or [])[:8] if t.get("tag")
+        ],
+        "stages": [
+            {
+                "name": s.get("name"),
+                "weeks": s.get("weeks"),
+                "start": s.get("start"),
+                "end": s.get("end"),
+                "focus": s.get("focus"),
+                "checkpoint": s.get("checkpoint"),
+            }
+            for s in plan.get("stages") or []
+        ],
+        "priority_kps": [
+            {
+                "subject": k.get("subject"),
+                "tag": k.get("tag"),
+                "frequency": k.get("frequency"),
+                "roi_label": k.get("roi_label"),
+            }
+            for k in (plan.get("priority_kps") or [])[:12]
+        ],
+        "guide_overview": str((plan.get("guide") or {}).get("overview") or "")[:800],
+        "risk_notes": plan.get("risk_notes") or [],
+    }
+    summary = (
+        f"已生成 {data['weeks']} 周规划"
+        f"（{len(data['stages'])} 个阶段，总 {data['total_hours']:g}h）"
+        + ("；薄弱科目来自画像" if weak_from_profile else "")
+    )
+    return data, summary
+
+
+def _read_profile(self: AgentTools) -> tuple[Any, str]:
+    prof = _profile_view(self)
+    quiz = prof.get("quiz") or {}
+    exe = prof.get("execution") or {}
+    data = {
+        "client_id": self.client_id,
+        "total_questions": prof.get("total_questions", 0),
+        "top_tags": (prof.get("top_tags") or [])[:8],
+        "quiz": {
+            "total": quiz.get("total", 0),
+            "correct": quiz.get("correct", 0),
+            "wrong_tags": (quiz.get("wrong_tags") or [])[:8],
+            "wrong_subjects": quiz.get("wrong_subjects") or {},
+        },
+        "execution": {
+            "checkins": exe.get("checkins", 0),
+            "done": exe.get("done", 0),
+            "tasks_total": exe.get("tasks_total", 0),
+            "failed_checkpoints": exe.get("failed_checkpoints") or [],
+        },
+        "plan": prof.get("plan"),
+        "boost_tags": prof.get("boost_tags") or [],
+    }
+    summary = (
+        f"画像：提问 {data['total_questions']} 次 · "
+        f"作答 {quiz.get('correct', 0)}/{quiz.get('total', 0)} 对 · "
+        f"打卡 {exe.get('done', 0)}/{exe.get('tasks_total', 0)}"
+    )
+    return data, summary
+
+
+def _record_checkin(
+    self: AgentTools,
+    week: int,
+    idx: int = 0,
+    done: bool = True,
+    subject: str = "",
+    kps: list[str] | None = None,
+    hours: float | None = None,
+    stage: str = "",
+) -> tuple[Any, str]:
+    from cs408rag.profile.store import get_profile_store
+
+    payload = {
+        "week": week,
+        "idx": idx,
+        "stage": stage,
+        "subject": subject,
+        "kps": [str(k) for k in (kps or [])][:8],
+        "hours": hours,
+        "done": bool(done),
+        # 不带 total：画像的任务总数只认 UI 打卡事件的 total，
+        # Agent 口头打卡不参与分母，避免虚报完成率。
+    }
+    get_profile_store().record(self.client_id, "checkin", payload)
+    mark = "完成" if done else "取消完成"
+    return (
+        {"recorded": True, "client_id": self.client_id, **payload},
+        f"已记录第 {week} 周第 {idx + 1} 项打卡（{mark}），画像执行统计已更新",
+    )
+
+
+def _judge_quiz(self: AgentTools, qid: str, choice: str) -> tuple[Any, str]:
+    from cs408rag.notebook.judge import judge
+    from cs408rag.profile.store import get_profile_store
+
+    r = judge(self.client_id, qid, choice)
+    if not r.get("known"):
+        return r, f"题库中没有 {qid} 或该题无答案，未判分"
+    get_profile_store().record(
+        self.client_id,
+        "quiz",
+        {
+            "qid": r["qid"],
+            "subject": r.get("subject") or "",
+            "tags": r.get("tags") or [],
+            "correct": bool(r.get("correct")),
+            "choice": choice,
+        },
+    )
+    mark = "答对，已从错题本移出" if r.get("correct") else f"答错（正确答案 {r.get('truth')}），已进错题本"
+    return r, f"{r['qid']} 作答 {choice}：{mark}"
+
+
 TOOL_REGISTRY: dict[str, Callable[..., tuple[Any, str]]] = {
     "search_knowledge_base": _search_knowledge_base,
     "search_knowledge_graph": _search_knowledge_graph,
@@ -364,45 +509,10 @@ TOOL_REGISTRY: dict[str, Callable[..., tuple[Any, str]]] = {
     "get_related_kps": _get_related_kps,
     "get_learning_path": _get_learning_path,
     "verify_answer": _verify_answer,
-}
-
-TOOL_SPECS: dict[str, dict[str, Any]] = {
-    "search_knowledge_base": {
-        "desc": "在教材与真题解析中做三路混合检索，返回带章节路径的资料片段。",
-        "args": {"query": "检索词", "subject": "可选，四科之一", "top_k": "可选，默认 8"},
-    },
-    "search_knowledge_graph": {
-        "desc": "在知识点图谱中定位一个知识点，返回章节路径、祖先与同节兄弟。",
-        "args": {"kp_name": "知识点名称"},
-    },
-    "read_figure": {
-        "desc": "读取某道真题的配图。T1 重建拓扑，T2 提取文本，T3 需视觉模型。",
-        "args": {"question_id": "真题编号，如 2009-04"},
-    },
-    "calculate": {
-        "desc": "计算一个算式（四则、幂、log2/sqrt/ceil 等），避免心算错误。",
-        "args": {"expr": "算式，如 (1-0.05)**3 或 log2(4096)"},
-    },
-    "get_exam_stats": {
-        "desc": "考点在历年真题中的考查频次、年份/科目/题型分布。",
-        "args": {"kp_name": "考点名，如 排序算法"},
-    },
-    "get_kp_questions": {
-        "desc": "某考点的历年真题原题（含年份、题干、选项；非评测模式含答案解析）。",
-        "args": {"kp_name": "考点名", "limit": "条数，默认 5"},
-    },
-    "get_related_kps": {
-        "desc": "与某考点关联的其他考点：真题共现（带证据题号）+ 图谱同节/祖先。",
-        "args": {"kp_name": "考点名"},
-    },
-    "get_learning_path": {
-        "desc": "该知识点的前置学习链（沿 PREREQUISITE 反向），用于学习路径推荐。",
-        "args": {"kp_name": "知识点名"},
-    },
-    "verify_answer": {
-        "desc": "自检：引用编号是否存在、真题编号是否真实、是否出现押题表述。",
-        "args": {"question": "问题", "answer": "待校验的回答", "contexts": "资料块"},
-    },
+    "generate_plan": _generate_plan,
+    "read_profile": _read_profile,
+    "record_checkin": _record_checkin,
+    "judge_quiz": _judge_quiz,
 }
 
 

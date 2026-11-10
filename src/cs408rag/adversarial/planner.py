@@ -71,6 +71,84 @@ SUBJECT_METHODS = {
     },
 }
 
+# 公开经验贴里反复出现的分科「抓手」：可直接照做的具体动作，区别于上面的方法主线。
+SUBJECT_HANDLES = {
+    "数据结构": [
+        "选择部分靠概念打牢，结构与排序的判定条件要能当场推，不要靠感觉",
+        "算法题写伪代码即可，逻辑对就能拿分；想不出最优解就写暴力解，暴力也能拿大部分分，别空着",
+        "排序一章知识点零散，适合自己拉一张表对比着记，比反复看书管用",
+    ],
+    "组成原理": [
+        "画数据通路图：取指 → 译码 → 执行，边画边说出每个部件在做什么",
+        "Cache / 主存计算题成套练；存储器、数据通路、外设数据传送是命题重区",
+    ],
+    "操作系统": [
+        "PV 每天动笔写经典模型：生产者-消费者、读者-写者、哲学家进餐、银行家算法",
+        "页面置换与死锁必要条件要能脱口而出；算命中率必须写过程",
+        "os 引导、地址变换、外存调入内存都是流程，大题不好上手就慢慢画流程图，画着画着就通了",
+    ],
+    "计算机网络": [
+        "每层一张卡片：功能 / 核心协议 / 常用端口，碎片时间翻",
+        "IP 与子网划分每天 3 道新题，练到看地址就能条件反射出步骤",
+        "冷门协议（BGP、PPP 这类）也要知道个大概，近年命题偶尔会端上来，但不用挖很深",
+    ],
+}
+
+
+# 已甄别的公开经验贴：只保留正文有实质内容、无引流/卖资料特征的帖子。
+# 广告/标题党特征（30 天、极限、可复制、雷霆手段、毫无保留）一律不采信。
+EXPERIENCE_SOURCES = [
+    {
+        "title": "过来人忠告：真正的408根本不是xhs上那样",
+        "author": "哈哈",
+        "platform": "小红书",
+        "likes": 2730,
+        "url": "https://www.xiaohongshu.com/explore/6a6db120000000002701d90e",
+        "used_for": "预期管理、分科做法、真题与错题复盘",
+    },
+    {
+        "title": "11408上岸经验帖",
+        "author": "流心芝士球",
+        "platform": "小红书",
+        "likes": 3693,
+        "url": "https://www.xiaohongshu.com/explore/6a05eded000000000702996b",
+        "used_for": "整体节奏框架（作者声明纯干货无广告）",
+    },
+    {
+        "title": "8月开408，觉得学不完的可以参考下我",
+        "author": "Swixnsk",
+        "platform": "小红书",
+        "likes": 2046,
+        "url": "https://www.xiaohongshu.com/explore/6a73073b000000002402c17f",
+        "used_for": "时间紧张时的取舍与起步顺序",
+    },
+    {
+        "title": "26考研 11408一战上岸北大软微 411分经验帖",
+        "author": "单线程",
+        "platform": "腾讯频道",
+        "likes": None,
+        "url": "https://pd.qq.com/g/91271051646035140/post/B_9daddb69e37502001441152189427547470X60",
+        "used_for": "阶段任务安排、两科交叉防遗忘、算法题暴力解策略",
+    },
+    {
+        "title": "我与408计算机专业课129分同学的对话",
+        "author": "I·Am·Legend",
+        "platform": "B站专栏",
+        "likes": 289,
+        "url": "https://m.bilibili.com/opus/406280498634333039",
+        "used_for": "跨考心态、三轮节奏、计组画图与课本用法",
+    },
+]
+
+# 用户问题类型 -> 对应经验贴标题（② 每条问题后显示来源）
+CONCERN_SOURCES = {
+    "basics": "我与408计算机专业课129分同学的对话",
+    "time": "8月开408，觉得学不完的可以参考下我",
+    "slow_calc": "过来人忠告：真正的408根本不是xhs上那样",
+    "memory": "过来人忠告：真正的408根本不是xhs上那样",
+    "past_paper": "过来人忠告：真正的408根本不是xhs上那样",
+}
+
 
 # ---------------------------------------------------------------------------
 # 日期与预算
@@ -194,6 +272,35 @@ def _match_tags(analyzer: ExamAnalyzer, text: str) -> list[tuple[str, str]]:
     return hits
 
 
+MAX_PROFILE_BOOST = 8  # 画像加权上限：boost 考点必进 priority_kps，太多会挤掉高频考点
+
+
+def normalize_profile_tags(raw: Any, analyzer: ExamAnalyzer) -> list[dict[str, str]]:
+    """把画像里的高频考点整理成 boost_tags 形式。
+
+    接受 [{"subject","tag"}] 或 ["tag"]；tag 必须是真实考点，科目缺失时
+    取该考点真题的主科目。与 concerns 的 tag_hits 走同一条 boost 通道。
+    """
+    out: list[dict[str, str]] = []
+    for item in (raw or [])[:16]:
+        if isinstance(item, dict):
+            tag = str(item.get("tag") or "").strip()
+            subj = str(item.get("subject") or "").strip()
+        else:
+            tag, subj = str(item).strip(), ""
+        if not tag or tag not in analyzer.by_tag:
+            continue
+        if not subj:
+            qs = analyzer.by_tag.get(tag) or []
+            subj = qs[0].subject if qs else ""
+        entry = {"subject": subj, "tag": tag}
+        if subj and entry not in out:
+            out.append(entry)
+        if len(out) >= MAX_PROFILE_BOOST:
+            break
+    return out
+
+
 def route_concerns(
     goal: dict[str, Any], analyzer: ExamAnalyzer
 ) -> dict[str, Any]:
@@ -246,6 +353,7 @@ def route_concerns(
                 "action": action,
                 "stage": stage,
                 "checkpoint": checkpoint,
+                "source": CONCERN_SOURCES.get(primary, ""),
             }
         )
 
@@ -303,7 +411,8 @@ def _concern_text(
     return (
         "问题描述较笼统，无法直接定位到考点",
         "把问题拆成每周可检查的小目标；每周复盘一次，记录未完成原因",
-        "强化",
+        # 笼统问题说明还没起步，归入最早的基础阶段而非强化
+        "基础",
         "每周有明确的完成/未完成判定，而不是只看学习时长",
     )
 
@@ -629,7 +738,11 @@ def _task_text(
     *,
     timed: bool,
     review: bool,
+    drill_label: str = "",
+    drill_count: int = 0,
+    mock_no: int = 0,
 ) -> tuple[str, str, str]:
+    """阶段决定方法框架，drill_label / mock_no 让同一阶段的不同周真的不一样。"""
     names = "、".join(r.tag for r in kps) or subject
     must = "、".join(
         [m for r in kps[:2] for m in (r.must_learn or [])][:4]
@@ -655,27 +768,53 @@ def _task_text(
         )
         accept = f"近 5 年 {names} 选择题 ≥80%；计算/图表题能独立写出步骤"
     elif phase == "真题":
-        content = f"真题套卷（{subject}）" + (f"；补漏 {names}" if kps else "")
+        # 按周切年份区间：否则同一阶段的每一周文案完全相同
+        label = drill_label or "近 10 年"
+        content = f"真题套卷（{subject}）：{label}" + (
+            f"（{drill_count} 套）" if drill_count else ""
+        ) + (f"；补漏 {names}" if kps else "")
         method = (
-            "对应三轮：从 09 年开始；前期分科目/题型适应，近 10 年套卷严格计时（时间不够至少近 3–5 年）；"
+            "对应三轮：前期分科目/题型适应，近 10 年套卷严格计时（时间不够至少近 3–5 年）；"
             "每套逐题复盘吃透考点，标记选择题反复考点/大题固定角度；"
             "二刷检验能否独立写完整步骤；模拟 3–5 套，重心仍真题"
         )
-        accept = "套卷 3 小时计时完成；错题归因完成；同类题二刷 ≥90%"
+        method += f"；本周完成 {label} 套卷并逐套复盘"
+        accept = (
+            f"{label} 套卷 3 小时计时完成；错题归因完成；同类题二刷 ≥90%"
+        )
     else:
-        content = f"全真模考 + 高频清单：{names}"
+        head = f"全真模考（第 {mock_no} 套）" if mock_no else "全真模考"
+        content = f"{head} + 高频清单：{names}"
         method = (
             "对应四轮：知识点快翻高频和反复错；模拟 3–5 套；"
             "时间不够宁可少模拟也要真题再刷；考前收窄，只过错题、"
             "核心计算、流程步骤、标准题型框架；最后一周反复过"
         )
-        accept = "模考分数稳定；高频清单无盲区"
+        accept = (
+            f"模考第 {mock_no} 套完成；高频清单无盲区"
+            if mock_no
+            else "模考分数稳定；高频清单无盲区"
+        )
     if timed:
         method += "；本任务限时"
         accept = accept.replace("≥", "限时 ≥")
     if review:
         method += "；开始前先回顾上周错题"
     return content, method, accept
+
+
+def _split_years(years: list[int], n: int) -> list[list[int]]:
+    """把年份均分给 n 周；n 大于年份数时后面的周为空。"""
+    if n <= 0:
+        return []
+    size, extra = divmod(len(years), n)
+    out: list[list[int]] = []
+    i = 0
+    for k in range(n):
+        take = size + (1 if k < extra else 0)
+        out.append(years[i:i + take])
+        i += take
+    return out
 
 
 def build_weekly_plan(
@@ -714,6 +853,17 @@ def build_weekly_plan(
             idx += 1
     if not phase_of_week:
         phase_of_week = {i: "强化" for i in range(1, weeks + 1)}
+
+    # 同一阶段内按周序号区分（真题分年份区间、冲刺分模考套数），
+    # 否则同阶段的每一周文案完全相同，周计划表会退化成重复行。
+    phase_week_index: dict[int, tuple[int, int]] = {}
+    by_phase: dict[str, list[int]] = {}
+    for w_, p_ in sorted(phase_of_week.items()):
+        by_phase.setdefault(p_, []).append(w_)
+    for ws in by_phase.values():
+        for no, w_ in enumerate(ws, start=1):
+            phase_week_index[w_] = (no, len(ws))
+    exam_years = list(range(2009, exam.year + 1))
 
     # 学习周按经验贴顺序分块：DS → 组成+OS → 网络；
     # 真题/冲刺主攻薄弱科目。极短周期分不到块时，至少标出本周主攻。
@@ -773,17 +923,40 @@ def build_weekly_plan(
                 take = queue[: per_task[subject]]
                 queues[subject] = queue[len(take):]
             elif phase == "冲刺":
-                take = (kps_by_subject.get(subject) or [])[:5]
+                # 冲刺同样按周轮换高频清单，否则每周都是同样的前 5 个考点
+                pool = kps_by_subject.get(subject) or []
+                if pool:
+                    size = min(5, len(pool))
+                    offset = ((w - 1) * size) % len(pool)
+                    take = [pool[(offset + i) % len(pool)] for i in range(size)]
 
             if not take:
-                # 队列空了：用该科最高频考点做回顾/模考，不再引入新考点
-                take = (kps_by_subject.get(subject) or [])[:3]
+                # 队列空了：用该科高频考点做回顾/模考，不再引入新考点。
+                # 这里必须按周轮换取切片——若固定取前 3 个，同阶段后期每一周的
+                # 文案会完全一致，周计划就退化成重复行（实测第 24–27 周全同）。
+                pool = kps_by_subject.get(subject) or []
+                if pool:
+                    size = min(3, len(pool))
+                    offset = ((w - 1) * size) % len(pool)
+                    take = [pool[(offset + i) % len(pool)] for i in range(size)]
+            pw_no, pw_count = phase_week_index.get(w, (1, 1))
+            drill_label = ""
+            drill_count = 0
+            if phase == "真题":
+                chunk = _split_years(exam_years, pw_count)
+                years = chunk[pw_no - 1] if pw_no - 1 < len(chunk) else []
+                if years:
+                    drill_label = f"{years[0]}–{years[-1]} 年"
+                    drill_count = len(years)
             content, method, accept = _task_text(
                 phase,
                 subject,
                 take,
                 timed=bool(effects.get("timed_practice")),
                 review=bool(effects.get("review_every_week")),
+                drill_label=drill_label,
+                drill_count=drill_count,
+                mock_no=pw_no if phase == "冲刺" else 0,
             )
             if subject in focus_map.get(w, []):
                 content = "本周主攻：" + content
@@ -832,6 +1005,28 @@ def build_weekly_plan(
 # ---------------------------------------------------------------------------
 
 
+def _crunch_text(budget: dict[str, Any], progress: dict[str, str]) -> str:
+    """时间不够时的取舍建议；剩得少且多科还在一轮时，先说破合并节奏。"""
+    weeks = budget["remaining_weeks"]
+    if weeks > 12:
+        return ""
+    text = ""
+    behind = [s for s in SUBJECTS if progress.get(s) in ("未开始", "一轮中")]
+    if len(behind) >= 3:
+        text += (
+            f"直说一句：只剩 {weeks} 周，而{('、'.join(behind))}还在一轮，"
+            "基础和强化没法分两遍了——过一章就立刻做这章的选择题，把做题融进第一轮；"
+            "低频考点这一轮直接放掉，只保高频。"
+            "这不是理想方案，是这个时间点最现实的选择。"
+        )
+    text += (
+        "先把选择题和高频大题保住："
+        "PV、Cache、页表、子网划分这几块该拿的分一定要拿到，边缘考点该放就放。"
+        "真题只做近十年，模拟题最多两套，剩下的时间留给复盘。"
+    )
+    return text
+
+
 def build_guide_template(
     goal: dict[str, Any],
     budget: dict[str, Any],
@@ -862,20 +1057,22 @@ def build_guide_template(
         name = p["name"]
         if name == "基础":
             text = (
-                "对应一轮：先看懂概念和标准解题步骤，不急着独立写大题；"
-                "每学完一节立刻做对应选择题；错题回到概念/笔记位置，不攒错题。"
+                "对应一轮：目标是把四科的概念和标准解题步骤看懂，不急着独立写大题。"
+                "单科一本一本过，每科控制在三到六周，拖太久前面学的全还回去了；"
+                "每学完一节立刻做对应选择题，错题当天回到概念位置搞懂，不攒着。"
             )
         elif name == "强化":
             text = (
-                "对应二轮：重心从看懂转向做题；第二轮内容快过，重点看一轮卡住和"
-                "错题对应知识点；大题上手；固定题型专项练；选择题二刷要能说出"
-                "每个选项为什么对/错。"
+                "对应二轮：重心从看懂转向做题。第二轮快过，只看一轮卡住的和错题"
+                "对应的知识点；大题从这一轮开始上手，固定题型专项练；选择题二刷，"
+                "要能说出每个选项为什么对、为什么错。"
+                "计组的乘法器、除法器这类硬骨头放这一轮啃正合适，一轮碰了也会忘。"
             )
         elif name == "真题":
             text = (
                 "对应三轮：从 09 年开始；前期分科目/题型适应，近 10 年套卷严格计时（时间不够至少近 3–5 年）；"
                 "每套逐题复盘吃透考点；二刷检验能否独立写完整步骤；模拟 3–5 套，"
-                "重心仍真题。"
+                "重心仍真题。24 到 26 的大题明显难一档，模拟分难看很正常，别被打击。"
             )
         else:
             text = (
@@ -888,7 +1085,6 @@ def build_guide_template(
     subject_strategy = []
     for s in SUBJECTS:
         rows = kps_by_subject.get(s) or []
-        top = "、".join(r.tag for r in rows[:3]) or "暂无"
         cov = coverage.get(s, {}).get("ratio", 0)
         tail = (
             "先补概念与选择题。"
@@ -901,22 +1097,23 @@ def build_guide_template(
                 tc[key] = tc.get(key, 0) + val
         total_types = sum(tc.values()) or 1
         calc_fig = (tc.get("calc", 0) + tc.get("figure", 0)) / total_types
-        sm = SUBJECT_METHODS.get(s, {})
-        strategy = (
-            f"主线是{sm.get('focus', '高频考点')}：{sm.get('method', '')}。"
-            f"优先 {top}；本轮按 tag 覆盖该科历史考查约 {cov:.0%}。"
-            f"你当前进度是{progress.get(s, '未开始')}，{tail}"
+        handles = list(SUBJECT_HANDLES.get(s) or [])[:3]
+        strategy = " ".join(handles)
+        if strategy:
+            strategy += " "
+        if s in weak:
+            strategy += (
+                "这科是你自己标的弱科，时间分配上已经给它加权了。"
+                "弱科提分空间最大，建议每天状态最好的第一个学习块就给它，"
+                "别只用碎片时间糊弄弱科。"
+            )
+        strategy += (
+            f"按 tag 算，这一轮能覆盖该科历史考查的 {cov:.0%}；"
+            f"你现在{progress.get(s, '未开始')}，{tail}"
         )
         if calc_fig >= 0.3:
-            strategy += f" 该科选中考点里计算/图表占 {calc_fig:.0%}，优先练步骤和画图。"
-        subject_strategy.append(
-            {
-                "subject": s,
-                "strategy": strategy,
-                "pitfalls": list(sm.get("pitfalls") or [])[:3]
-                + ["错题只抄答案，不写错因"],
-            }
-        )
+            strategy += f"另外，选中的考点里计算和图表占 {calc_fig:.0%}，要优先练步骤和画图。"
+        subject_strategy.append({"subject": s, "strategy": strategy})
 
     days = budget["study_days_per_week"]
     daily = budget["daily_hours"]
@@ -927,54 +1124,89 @@ def build_guide_template(
     else:
         split = "时间少时先保证 30min 刷题 + 15min 错题，再挤新内容"
     rest = "每周至少留半天机动" if days >= 7 else "每周留 1 天机动或复盘"
-    weekly_routine = (
-        f"每周学 {days} 天、每天 {daily:g}h；{split}；{rest}。"
-        "错题优先于新题；复盘只做错题与高频清单，不新增知识点。"
-    )
-    pitfalls = [
-        "只看不练，选择题看着会、做起来错",
-        "第一轮只看不练，后面还得返工",
-        "错题攒着，想回头再补",
-        "大题留到最后，前面只做选择题",
-        "真题只做近几年，早年为省时间完全不碰",
-        "真题做了不限时，考场节奏没练过",
-        "模拟题做太多，挤掉真题二刷",
-        "考前还开新知识点",
-        "计划排太满，没有机动日，一次拖延整周崩",
-        "熬夜补进度，白天效率下降",
-    ]
-    checkpoints = [f"{p['name']}：{p['checkpoint']}" for p in phases]
-    checkpoints += [
-        "选择题二刷：能说出每个选项为什么对/错",
-        "大题：能独立写完整步骤，不只记答案",
-    ]
-    if concern_actions:
-        checkpoints.append(
-            "用户问题：每条都要有可检查的结果，见「你的问题 → 计划怎么解决」"
-        )
-
     rationale = (
         f"按剩余 {budget['remaining_weeks']} 周压缩为 {phase_names}；"
         "科目时间按 408 分值权重分配，薄弱科目与进度落后的科目加权；"
         "考点按频次、近 5 年出现、计算/图表占比排序，短周期只保高频，长尾不新学。"
     )[:300]
+    try:
+        target = int(float(goal.get("target_score") or 110))
+    except (TypeError, ValueError):
+        target = 110
+    if target <= 90:
+        target_advice = (
+            f"你目标 {target} 分这一档，策略反而清晰：高频选择题和大题基础分保住，"
+            "偏题、冷门考点直接放，把会做的分拿满就够，不用追求面面俱到。"
+        )
+    elif target >= 120:
+        target_advice = (
+            f"你目标 {target} 分这一档，意味着不能留死角："
+            "冷门考点也得混个脸熟，真题之外模拟题要加量，选择题正确率得稳定在八成以上。"
+        )
+    else:
+        target_advice = (
+            f"你目标 {target} 分这一档，大头在高频考点；"
+            "冷门考点不用深挖，但起码混个眼熟，考场上遇到了能写出步骤分。"
+        )
     return {
         "overview": overview,
         "phase_advice": phase_advice,
         "subject_order": (
-            "起步晚时建议一门一门过：数据结构 → 组成原理 + 操作系统 → 计算机网络；"
-            "数据结构是其他三门的基础，组成与 OS 交叉多，网络最后（杂但浅）。"
-            "8 周这种极短周期拆不开，采用「每周主攻 1–2 科 + 其他科维持」，"
-            "不四科齐头并进。"
+            "起步顺序我建议按数据结构、组成原理、操作系统、计算机网络来。"
+            "数据结构是另外三门的地基，组成和操作系统交叉多，网络最独立，放最后也来得及。"
+            "基础阶段别一科死磕到底，两门交叉着学——计组和操作系统关系密切放一起，"
+            "数据结构和计网放一起，能少很多「学完一科忘一科」的灾难性遗忘。"
+            "但也别四科齐头并进——每周主攻一到两科、其他科留一点碎时间维持手感，"
+            "这样每一科都能真正推下去；八周这种极短周期尤其要这么办。"
         ),
         "subject_strategy": subject_strategy,
-        "weekly_routine": weekly_routine,
-        "pitfalls": pitfalls,
-        "checkpoints": checkpoints,
-        "note": (
-            "以下是根据公开经验贴常见做法整理的通用方法，不是提分承诺；"
-            "请按自己的时间、进度和薄弱科目裁剪。"
+        "weekly_routine": (
+            f"{split}，{rest}。"
+            "我自己的习惯是上午脑子清醒留给新内容，下午做题，晚上复盘错题；"
+            "每周留半天彻底不学，弦绷太紧反而断。"
+            "原则只有一条——错题优先于新题；复盘只看错题和高频清单，别再往脑子里塞新知识点。"
+            "排太满的计划一旦拖延一次，整周都会崩，所以宁可少排一点。"
         ),
+        "paper_usage": (
+            "真题是唯一权威，至少刷两遍。我自己的做法是三轮："
+            "第一轮按题型拆开做，只做近十年，早年的题放弃也不亏；"
+            "第二轮按年份整套做，但只重做第一轮错的题和标记过的题，不用从头再刷一遍；"
+            "第三轮抽两三套整卷，严格按一百八十分钟模拟——计时、用答题卡、一天一套，"
+            "这套反向输出的过程就是逼你不断回忆常考点，直到成肌肉记忆。"
+            "真题没刷完之前，别碰模拟题；考前留十来天回归书本通看一遍，再过错题。"
+        ),
+        "review_workflow": (
+            "错题我按四步处理：先归类，是概念不清、计算失误、审题偏差还是时间不够，"
+            "写一句话，不要写「粗心」；然后回到对应考点，补三句话——考什么、怎么判定、"
+            "易错点在哪；当天再找两道同类题做对，才算过关；最后隔七天和三十天各重做一次，"
+            "连续两次都对了再移出错题本。这套流程比多刷十道新题有用。"
+        ),
+        "pacing": (
+            "考场上我会这样分时间：选择题四十五分钟内结束，每题一分到一分半，卡住就跳；"
+            "大题留一百二十分钟，先做会做的；最后十五分钟检查涂卡和计算。"
+            "做题顺序按自己的强项排，不必非得按卷面顺序。"
+            "另外提醒一句：近三年卷子阅读量明显变大，经常先读一段长题干再自己判断考什么，"
+            "别再指望还能轻松留半小时检查；遇到完全没见过的考点也正常——偏的题大家都不会，"
+            "稳住心态把熟练的分拿满就行。"
+        ),
+        "expectation": (
+            "先说个可能不太中听的：你在网上刷到的高分贴，大多数是幸存者。"
+            "考一百来分的人基本不发帖，所以看起来满屏都是 130+。"
+            "目标分数别对标帖子，去查你报考院校历年的复试名单，"
+            "看上岸的人 408 实际考多少，按那个数排优先级。"
+            + target_advice +
+            "看到标题里写着「30 天」「极限」「可复制」的，"
+            "可以直接划走，那种多半是引流或者卖资料的。"
+            "还有一件事提前说了能少很多焦虑：408 体量太大，遗忘是必然的，"
+            "学完一本忘一本人人如此，大部分人要到十一月才把常考点记全，"
+            "忘了就回去翻，这不是你一个人的问题。"
+        ),
+        "crunch": _crunch_text(budget, progress),
+        "note": (
+            "这篇是按公开经验贴里反复出现的做法整理的，不是提分承诺，"
+            "按自己的时间、进度和薄弱科目裁剪。"
+        ),
+        "sources": EXPERIENCE_SOURCES,
     }, rationale
 
 
@@ -1006,6 +1238,11 @@ def build_detailed_plan(
 
     routed = route_concerns(goal, analyzer)
     effects = routed["effects"]
+
+    # 提问画像 -> boost_tags：用户高频提问的考点与 concerns 命中的考点同通道加权
+    for item in normalize_profile_tags(goal.get("profile_tags"), analyzer):
+        if item not in effects["boost_tags"]:
+            effects["boost_tags"].append(item)
 
     # 规则挑战 -> 生成器的修正（主要针对缺失考点/薄弱科目）
     for c in challenges or []:

@@ -1,31 +1,39 @@
-"""Streamlit 演示界面。
+"""Streamlit 演示界面：单页 Agent 中枢。
 
-六块：
-    1. 问答 —— 提问、看流式回答、看引用了哪些章节
-    2. Agent 备考助手 —— 推理链、工具调用、图解析、考点卡片
-    3. 检索调试 —— 展示三路各自召回了什么、RRF 融合前后排名怎么变
-    4. 考点分析 —— 基于历年真题频次的客观统计与关联
-    5. 实验数据 —— 检索消融结果
-    6. 对抗规划 —— 规则/LLM 实时质疑 Plan，展示修订轨迹
+聊天是唯一主入口（13 个确定性工具：教材检索 / 知识图谱 / 考点统计 / 真题检索 /
+关联考点 / 学习路径 / 图形解析 / 计算器 / 答案校验 / 生成规划 / 画像 / 判分）。
+看板与图表内嵌在会话流里，与对话联动：
+    📅 我的规划执行 —— 侧栏入口，点击弹出：阶段路线 / 周计划 /
+       HITL 人工裁定（规划是独立记录，不进会话流）
+    📊 考点图表 —— 考情类回答内嵌该考点的客观频次 / 题型分布（不是模型预测）
+侧栏为会话列表 + 系统自动生成的学习总结。单轮问答页已下线：其价值是消融对照，
+演示时走 API / 评测脚本（reports/ablation_dev.json）。
 
-第 2、3、6 块是这个界面真正的价值：面试时能直观说明
-「这个数字是怎么来的」「Agent 到底做了什么」「质疑是否可验证」，
-而不是只给一个最终答案。
+面试叙事：这个页面能直观说明「这个数字是怎么来的」「Agent 到底做了什么」
+「计划是否可执行」，而不是只给一个最终答案。
 """
 
 from __future__ import annotations
 
+import json
 import sys
+import uuid
 from pathlib import Path
 
 import streamlit as st
 
 # 允许直接 streamlit run app/streamlit_app.py
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(ROOT / "src"))
+APP_DIR = Path(__file__).resolve().parent
+for _p in (ROOT / "src", APP_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
-st.set_page_config(page_title="408-RAG", page_icon="📚", layout="wide")
+import plan_ui  # noqa: E402
+
+from cs408rag.profile.store import get_profile_store  # noqa: E402
+
+st.set_page_config(page_title="408 备考 Agent", page_icon="🤖", layout="wide")
 
 
 @st.cache_resource(show_spinner="加载检索链路…")
@@ -37,16 +45,6 @@ def get_pipeline():
     pipe = RetrievalPipeline()
     pipe.retrieve("预热", config=RetrievalConfig(exclude_explanations=False))
     return pipe
-
-
-@st.cache_data(show_spinner=False)
-def load_eval_summary() -> dict | None:
-    import json
-
-    p = ROOT / "reports" / "ablation_dev.json"
-    if not p.exists():
-        return None
-    return json.loads(p.read_text(encoding="utf-8"))
 
 
 @st.cache_resource(show_spinner="加载 Agent 与考点库…")
@@ -82,1009 +80,710 @@ def render_images(images: list[dict], *, width: int = 420) -> None:
         st.caption(f"（本节有 {len(images)} 张插图，但索引中未找到对应文件）")
 
 
-# 对抗规划：角色 -> (图标, 说明)。颜色靠图标区分，避免依赖主题色。
-ADV_NODE_LABELS = {
-    "plan_gen": ("🧭 规划", "生成 / 修订 Plan"),
-    "rule_guard": ("🛡 规则质疑", "6 类可验证规则，不调 LLM"),
-    "llm_critic": ("🗣 LLM 质疑", "只挑规则未覆盖的问题"),
-    "arbitrate": ("⚖️ 专家裁定", "真题频次 + 前置边"),
-    "advance": ("📌 推进", "决定继续或退出"),
-}
+def _recommend_questions(
+    text: str, *, limit: int = 3, exclude_qid: str | None = None
+) -> list[dict]:
+    """按对话文本命中的考点标签推荐真题，高频考点优先。
 
-ADV_STOP_LABELS = {
-    "converged": "✅ 收敛",
-    "max_rounds": "⏹ 达到最大轮数",
-    "stalled": "⏸ 修订停滞",
-    "degraded": "⚠️ 降级为规则",
-    "budget": "⏱ 预算上限",
-    "error": "❌ 执行失败",
-}
-
-ADV_TYPE_LABELS = {
-    "concept": "概念",
-    "calc": "计算",
-    "figure": "图表",
-    "cross_subject": "跨科目",
-}
-
-
-def _types_text(types: dict | None) -> str:
-    return " / ".join(
-        f"{ADV_TYPE_LABELS.get(k, k)} {v}" for k, v in (types or {}).items()
-    )
-
-
-def _adv_detail(entry: dict) -> str:
-    node = entry.get("node")
-    if node == "plan_gen":
-        plan_src = entry.get("plan_source") or (
-            "llm_enriched" if entry.get("used_llm") else "deterministic"
-        )
-        guide_src = entry.get("guide_source") or (
-            "llm" if entry.get("used_llm") else "template"
-        )
-        return (
-            f"第 {entry.get('version')} 版 · 结构 {plan_src} · 文案 {guide_src}"
-            f" · {entry.get('took_ms', 0)}ms"
-        )
-    if node == "rule_guard":
-        return (
-            f"{entry.get('n_challenges', 0)} 条挑战"
-            f"（high {entry.get('n_high', 0)}） · {entry.get('took_ms', 0)}ms"
-        )
-    if node == "llm_critic":
-        if entry.get("skipped"):
-            return "未启用 LLM，已跳过"
-        state = "成功" if entry.get("ok") else "失败 / 空回答"
-        return f"新增 {entry.get('n_new', 0)} 条 · {state} · {entry.get('took_ms', 0)}ms"
-    if node == "arbitrate":
-        return (
-            f"{entry.get('n_conflicts', 0)} 条争议 → "
-            f"{entry.get('n_verdicts', 0)} 条裁定 · {entry.get('took_ms', 0)}ms"
-        )
-    if node == "advance":
-        stop = ADV_STOP_LABELS.get(entry.get("stop_reason") or "", "继续修订")
-        return (
-            f"第 {entry.get('round')} 轮 · 残留 high {entry.get('open_high', 0)} · "
-            f"新增 {entry.get('new_high', 0)} · 解决 {entry.get('resolved', 0)} → {stop}"
-        )
-    return ""
-
-
-def render_adv_timeline(entries: list[dict], placeholder) -> None:
-    """把状态机的每一步画成按角色区分的 st.status。"""
-    with placeholder.container():
-        for entry in entries:
-            icon, desc = ADV_NODE_LABELS.get(entry.get("node"), ("•", entry.get("node") or ""))
-            detail = _adv_detail(entry)
-            # 计数写进标题：st.status 折叠时 caption 不可见，时间线会退化成
-            # 一排没有信息的「已完成」。
-            with st.status(f"{icon} {desc} · {detail}", state="complete", expanded=False):
-                st.caption(detail)
-
-
-# ---------------------------------------------------------------------------
-
-st.title("📚 408-RAG")
-st.caption(
-    "面向考研 408 的真题检索问答系统 · "
-    "720 道真题（2009–2026）· 5296 个教材 chunk · 6182 个知识点节点"
-)
-
-tab_qa, tab_agent, tab_debug, tab_exam, tab_eval, tab_adv = st.tabs(
-    [
-        "💬 问答",
-        "🤖 Agent 备考助手",
-        "🔍 检索调试",
-        "📊 考点分析",
-        "📈 实验数据",
-        "🛡 对抗规划",
-    ]
-)
-
-# ---------------------------------------------------------------------------
-# 问答
-# ---------------------------------------------------------------------------
-with tab_qa:
-    from cs408rag.config import settings
-    from cs408rag.generation.prompt import build_context
-    from cs408rag.generation.service import DEFAULT_QA_CONFIG
-
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        q = st.text_input("提问", value="采用组相联映射时主存地址如何划分？")
-    with col2:
-        subject = st.selectbox("科目", ["不限", "数据结构", "组成原理", "操作系统", "计算机网络"])
-
-    if st.button("提问", type="primary"):
-        pipe = get_pipeline()
-        subj = None if subject == "不限" else subject
-        with st.spinner("检索中…"):
-            r = pipe.retrieve(q, subject=subj, config=DEFAULT_QA_CONFIG)
-            blocks = build_context(r.top_hits(8))
-
-        st.subheader("引用来源")
-        for b in blocks:
-            n_img = len(b.images)
-            label = f"[{b.index}] {b.citation}" + (f"  🖼 {n_img}" if n_img else "")
-            with st.expander(label, expanded=(n_img > 0)):
-                st.write(b.text)
-                if n_img:
-                    st.markdown(f"**教材插图（{n_img} 张）**")
-                    render_images(b.images)
-
-        st.subheader("回答")
-        import os
-
-        has_key = bool(os.getenv("OPENAI_API_KEY") or settings.openai_api_key.strip())
-        if not has_key or settings.openai_api_key.startswith("sk-your"):
-            st.warning(
-                "未配置 LLM API key，跳过生成。**检索部分完全可用** —— "
-                "上面的引用来源就是检索链路的结果。\n\n"
-                "配置方法：`cp .env.example .env` 后填入 `OPENAI_API_KEY`。"
-            )
-        else:
-            from cs408rag.generation.llm import get_llm
-            from cs408rag.generation.prompt import qa_messages
-
-            # 首字延迟实测 15–45 秒（取决于模型与 max_tokens），
-            # 期间一个 token 都不会到。若什么都不显示，界面看起来像卡死。
-            # 所以先给一个明确的等待提示，收到第一个字后再切成流式渲染。
-            ph = st.empty()
-            ph.info("⏳ 模型生成中…首字延迟可能 15–45 秒，检索结果已在上面")
-            buf = ""
-            started = False
-            for piece in get_llm().stream(qa_messages(q, blocks)):
-                if not started:
-                    started = True
-                    ph.empty()
-                buf += piece
-                ph.markdown(buf + "▌")
-            ph.markdown(buf if buf else "（模型未返回内容）")
-
-# ---------------------------------------------------------------------------
-# Agent 备考助手
-# ---------------------------------------------------------------------------
-with tab_agent:
-    import json
-
-    st.subheader("Agent 编排：检索 + 计算器 + 图形解析 + 考点统计")
-    st.caption(
-        "概念题走检索，计算题调用计算器，图表题做 SVG 拓扑重建，"
-        "备考咨询查真实真题频次。下面是完整的推理链与工具调用记录。"
-    )
-
-    mode = st.radio(
-        "模式", ["开放问答", "选择题"], horizontal=True, key="agent_mode"
-    )
-    aq = st.text_input(
-        "问题", value="死锁这个考点历年考过几次？和哪些知识点关联？", key="agent_q"
-    )
-    ac1, ac2 = st.columns([2, 1])
-    with ac1:
-        aqid = st.text_input(
-            "真题编号（可选，如 2009-04；给了会启用图形解析）", value="", key="agent_qid"
-        )
-    with ac2:
-        asubj = st.selectbox(
-            "科目",
-            ["不限", "数据结构", "组成原理", "操作系统", "计算机网络"],
-            key="agent_subj",
-        )
-
-    opts: dict[str, str] = {}
-    if mode == "选择题":
-        st.markdown("**选项**")
-        oc = st.columns(4)
-        for i, letter in enumerate("ABCD"):
-            with oc[i]:
-                opts[letter] = st.text_input(letter, key=f"opt_{letter}")
-
-    if st.button("运行 Agent", type="primary", key="agent_run"):
-        runner = get_runner()
-        subj = None if asubj == "不限" else asubj
-        with st.spinner("Agent 执行中（含 LLM 生成，通常 10–60 秒）…"):
-            res = runner.run(
-                aq,
-                options=opts if mode == "选择题" else None,
-                subject=subj,
-                qid=aqid.strip() or None,
-                mode="quiz" if mode == "选择题" else "qa",
-            )
-        d = res.to_dict()
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("路由", d["route"])
-        k2.metric("耗时", f"{d['took_ms'] / 1000:.1f}s")
-        k3.metric("工具调用", d["n_tool_calls"])
-        k4.metric("选择题答案", d["choice"] or "—")
-
-        st.caption(f"路由理由：{d['route_reason']}")
-
-        st.markdown("**推理链**")
-        st.dataframe(
-            [
-                {
-                    "步骤": s["node"],
-                    "耗时(ms)": s["took_ms"],
-                    "详情": json.dumps(s.get("detail", {}), ensure_ascii=False)[:160],
-                }
-                for s in d["steps"]
-            ],
-            use_container_width=True,
-        )
-
-        st.markdown("**工具调用**")
-        for t in d["tool_calls"]:
-            icon = "✅" if t["ok"] else "❌"
-            with st.expander(
-                f"{icon} {t['tool']} · {t['took_ms']:.0f}ms · {t['summary']}"
-            ):
-                st.json(t.get("data"))
-
-        st.markdown("**回答**")
-        st.markdown(d["answer"] or f"（无回答：{d['error'] or '未知原因'}）")
-
-        v = d.get("verification") or {}
-        if v:
-            if v.get("ok"):
-                st.success(
-                    f"引用校验通过 · 引用精度 {v.get('citation_precision', 0):.0%} · "
-                    "未发现押题表述"
-                )
-            else:
-                st.warning(
-                    f"校验告警：无效真题编号 {v.get('invalid_exam_refs') or '无'}；"
-                    f"押题表述 {v.get('predictions') or '无'}"
-                )
-
-    st.divider()
-    st.markdown("**单独查看某题的图形解析**")
-    fq = st.text_input("真题编号", value="2009-04", key="fig_qid")
-    if st.button("解析图形", key="fig_run"):
-        from cs408rag.figures.read_figure import read_figure
-
-        fr = read_figure(fq.strip())
-        st.markdown(f"层级：**{fr.tier}** · 可用：**{fr.available}**")
-        st.text(fr.description)
-        if fr.note:
-            st.info(fr.note)
-
-# ---------------------------------------------------------------------------
-# 检索调试
-# ---------------------------------------------------------------------------
-with tab_debug:
-    st.subheader("各路召回对照")
-    st.caption(
-        "同一问题下，dense / sparse / BM25（可选图谱）各自召回了什么，"
-        "以及融合前后的排名变化。生产配置默认不含图谱，可勾选对照。"
-    )
-    dq = st.text_input("调试查询", value="KMP 算法中 next 数组怎么求", key="dq")
-    include_graph = st.checkbox("包含图谱路（生产默认关闭）", value=False, key="dbg_graph")
-
-    if st.button("运行", key="run_debug"):
-        from dataclasses import replace
-
-        from cs408rag.generation.service import DEFAULT_QA_CONFIG
-
-        pipe = get_pipeline()
-        cfg = replace(DEFAULT_QA_CONFIG, use_graph=include_graph, exclude_explanations=False)
-        r = pipe.retrieve(dq, config=cfg)
-
-        route_names = ["dense", "sparse"] + (["graph"] if include_graph else ["bm25"])
-        cols = st.columns(len(route_names))
-        for col, name in zip(cols, route_names, strict=True):
-            with col:
-                tr = r.routes.get(name)
-                st.markdown(f"**{name}**")
-                if not tr:
-                    st.caption("未启用")
-                    continue
-                st.caption(f"{tr.took_ms:.0f}ms · 召回 {len(tr.top_ids)}")
-                for cid in tr.top_ids[:6]:
-                    h = r.hits_by_id.get(cid)
-                    if h:
-                        snippet = h.text.replace("\n", " ")[:26]
-                        st.markdown(
-                            f"- `{cid[:8]}` {' > '.join(h.chapter_path)[:42]} · {snippet}"
-                        )
-
-        st.caption(
-            "同一章节路径可能出现多次——它们是**同一小节被切出的不同 chunk**，"
-            "chunk_id 与文本片段不同；三路各自的排名也不同。"
-        )
-
-        st.divider()
-        st.markdown("**RRF 融合后 top-10**")
-        for f in r.fused[:10]:
-            h = r.hits_by_id.get(f.doc_id)
-            if h:
-                snippet = h.text.replace("\n", " ")[:22]
-                st.markdown(
-                    f"- `{f.score:.5f}` `{f.doc_id[:8]}` 来源 `{f.ranks}` — "
-                    f"{' > '.join(h.chapter_path)[:48]} · {snippet}"
-                )
-
-        if r.rerank_applied:
-            st.success("已应用交叉编码器重排")
-
-# ---------------------------------------------------------------------------
-# 考点分析
-# ---------------------------------------------------------------------------
-with tab_exam:
+    匹配是纯子串：两百多个标签扫一遍对话文本是毫秒级，不值得动用检索链路。
+    """
     from cs408rag.agent.exam_analysis import get_analyzer
 
-    st.subheader("考点频次")
-    st.caption(
-        "统计自 720 道历年真题的标签，**是客观计数不是模型生成的判断**。"
-        "本系统只归纳「历年实际考了什么」，不做任何考试预测。"
-    )
     analyzer = get_analyzer()
-    dist = analyzer.tag_distribution()
+    out: list[dict] = []
+    seen: set[str] = {exclude_qid} if exclude_qid else set()
+    for tag in analyzer.tag_freq:  # tag_freq 已按考查次数降序
+        if not tag or tag not in text:
+            continue
+        for q in analyzer.questions_for_tag(tag, limit=limit):
+            if q["qid"] in seen:
+                continue
+            seen.add(q["qid"])
+            out.append(q)
+            if len(out) >= limit:
+                return out
+    return out
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("真题", dist["n_questions"])
-    c2.metric("考点标签", dist["n_tags"])
-    c3.metric("含图题", dist["by_type"].get("figure", 0))
-    c4.metric("计算题", dist["by_type"].get("calc", 0))
 
-    top_n = st.slider("显示前 N 个考点", 10, 50, 20)
-    items = analyzer.tag_freq
-    st.bar_chart({"考查次数": {k: items[k] for k in list(items)[:top_n]}})
+ROUTE_LABELS = {
+    "concept": ("概念题", "检索教材后由 LLM 归纳，引用可逐条核对"),
+    "calc": ("计算题", "路由到确定性计算器，不靠 LLM 算数"),
+    "figure": ("图表题", "路由到图形解析（拓扑重建），不靠 LLM 看图"),
+    "exam": ("考点统计", "路由到真题频次统计，只归纳客观计数"),
+    "cross": ("跨科目题", "多路检索合并后归纳"),
+    "plan": ("备考中枢", "规划/画像/判分工具编排，结果确定性成文，不经 LLM"),
+    "irrelevant": ("话题外", "与 408 无关，不检索不调工具"),
+}
+TOOL_LABELS = {
+    "search_knowledge_base": "教材检索",
+    "search_knowledge_graph": "知识图谱",
+    "read_figure": "图形解析",
+    "calculate": "计算器",
+    "get_exam_stats": "考点统计",
+    "get_kp_questions": "真题检索",
+    "get_related_kps": "关联考点",
+    "get_learning_path": "学习路径",
+    "verify_answer": "答案校验",
+    "generate_plan": "生成规划",
+    "read_profile": "读取画像",
+    "record_checkin": "打卡记录",
+    "judge_quiz": "作答判分",
+}
 
-    st.markdown("**查某个考点**")
-    kw = st.text_input("考点关键词（支持主题词，如「死锁」会汇总其下全部标签）", value="死锁")
-    if kw:
-        s = analyzer.stats(kw, example_limit=10)
-        if not s.total:
-            st.warning(f"没有匹配到「{kw}」的真题考点。")
-        else:
-            st.write(
-                f"**{s.tag}**：历年被考查 **{s.total}** 次 · "
-                f"匹配标签 {len(s.matched_tags)} 个（{'、'.join(s.matched_tags)}）"
+# Agent 的每种终止原因都要有对应文案：用户需要分清「没资料」和「系统坏了」
+STOP_REASON_VIEW = {
+    "answered": ("✅", "已给出答案"),
+    "no_evidence": ("🔍", "没检索到可用资料（不是系统故障）"),
+    "tool_error": ("⚠️", "工具执行失败，本轮结果不完整"),
+    "budget": ("⏱️", "Token 预算用尽，提前结束"),
+    "max_rounds": ("🔁", "达到最大轮数，提前结束"),
+    "clarification": ("❓", "需要补充信息才能继续"),
+    "irrelevant": ("🚫", "与 408 无关，未检索资料"),
+    "verify_retry": ("🔁", "重试一次后仍未通过校验"),
+}
+
+
+def _stop_reason_view(reason: str | None, error: str | None = None) -> tuple[str, str]:
+    icon, text = STOP_REASON_VIEW.get(
+        reason or "", ("•", f"未记录的终止原因（{reason or '空'}）")
+    )
+    if error:
+        text = f"{text}：{error[:80]}"
+    return icon, text
+
+
+# ---------------------------------------------------------------------------
+
+st.title("🤖 408 备考 Agent")
+st.caption(
+    "单页 Agent 中枢：聊天可调检索 / 图谱 / 规划 / 画像 / 判分等 13 个工具 · "
+    "720 道真题（2009–2026）· 5296 个教材 chunk · 6182 个知识点节点 · "
+    "规划看板与考点图表内嵌会话，随对话联动"
+)
+
+# ---------------------------------------------------------------------------
+# 用户画像（侧栏）：提问/规划事件按 ?cid= 累积，SQLite 持久化
+# ---------------------------------------------------------------------------
+_cid_param = (st.query_params.get("cid") or "").strip()
+if _cid_param:
+    cid = _cid_param
+else:
+    # 缺省不再共用 "default"：每个浏览器会话分配独立身份并写回 URL，
+    # 刷新后保持同一身份，同时避免所有匿名访问读到彼此的数据。
+    cid = st.session_state.get("_anon_cid") or f"anon-{uuid.uuid4().hex[:8]}"
+    st.session_state["_anon_cid"] = cid
+    st.query_params["cid"] = cid
+
+
+def _record_question(text: str, *, subject: str | None = None, qid: str | None = None) -> None:
+    """提问落库：提取命中的考点标签一并存下，画像统计直接用。"""
+    from cs408rag.agent.exam_analysis import get_analyzer
+    from cs408rag.profile.stats import extract_tags
+    from cs408rag.profile.store import get_profile_store
+
+    tags = extract_tags(text, get_analyzer())
+    get_profile_store().record(
+        cid,
+        "question",
+        {"text": text[:200], "subject": subject or "", "qid": qid or "", "tags": tags},
+    )
+
+
+def _quiz_feedback(q: dict, mi: int) -> None:
+    """推荐卡片内作答判分：点选项=提交作答。
+
+    接 notebook judge（答错进错题本、答对移出），同时记画像 quiz 事件 ——
+    答错考点是 planner 加权里优先级最高的薄弱信号。
+    作答状态按 qid 存 session_state，同一题在多张卡片里共享。
+    """
+    from cs408rag.notebook.judge import judge
+    from cs408rag.notebook.store import get_store
+    from cs408rag.profile.store import get_profile_store
+
+    opts = q.get("options") or {}
+    if not q.get("answer") or not opts:
+        return
+    answered = st.session_state.get(f"quiz_ans_{q['qid']}")
+    if answered:
+        mark = "✅ 答对" if answered["correct"] else f"❌ 答错（正确答案 {answered['truth']}）"
+        st.caption(f"你的作答 {answered['choice']} · {mark}，已同步错题本与画像")
+        return
+    item = get_store().get(cid, q["qid"])
+    if item:
+        st.caption(f"📕 此题在错题本中（累计错 {item['wrong_count']} 次），再挑战一次：")
+    cols = st.columns(len(opts))
+    for col, k in zip(cols, opts, strict=True):
+        if col.button(k, key=f"quiz_btn_{mi}_{q['qid']}_{k}", width="stretch"):
+            r = judge(cid, q["qid"], k)
+            st.session_state[f"quiz_ans_{q['qid']}"] = {
+                "choice": k,
+                "correct": bool(r.get("correct")),
+                "truth": r.get("truth") or "",
+            }
+            get_profile_store().record(
+                cid,
+                "quiz",
+                {
+                    "qid": q["qid"],
+                    "subject": q.get("subject") or "",
+                    "tags": q.get("tags") or [],
+                    "correct": bool(r.get("correct")),
+                    "choice": k,
+                },
             )
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                st.markdown("**年份分布**")
-                st.bar_chart({"次数": {str(y): n for y, n in sorted(s.by_year.items())}})
-            with cc2:
-                st.markdown("**题型分布**")
-                st.bar_chart({"次数": s.by_type})
+            st.rerun()
 
-            rel = analyzer.related_tags(kw, top_n=8)
-            if rel:
-                st.markdown("**关联考点（同题共现，证据为真题编号）**")
-                st.dataframe(
-                    [
-                        {
-                            "关联考点": r["tag"],
-                            "共现次数": r["cooccurrence"],
-                            "证据真题": "、".join(r["evidence"]),
-                        }
-                        for r in rel
-                    ],
-                    use_container_width=True,
-                )
 
-            st.markdown("**历年真题原题**")
-            for q in analyzer.questions_for_tag(kw, limit=10):
-                with st.expander(
-                    f"[{q['qid']}] {q['subject']} · {q['type']} · 答案 {q['answer']}"
-                ):
-                    st.write(q["question"])
-                    for k, v in (q.get("options") or {}).items():
-                        st.markdown(f"- **{k}.** {v}")
-                    if q.get("explanation"):
-                        st.caption(q["explanation"])
+def _delete_conversation(conv_id: str) -> None:
+    """删除会话；删的是当前会话时，自动落到剩余最近的会话或新建一条。
 
-# ---------------------------------------------------------------------------
-# 实验数据
-# ---------------------------------------------------------------------------
-with tab_eval:
-    st.subheader("检索消融实验")
-    data = load_eval_summary()
-    if not data:
-        st.info(
-            "还没有实验数据。运行：`uv run --no-sync python -m cs408rag.eval.run_eval --split dev`"
-        )
+    规划是独立记录（plans 表，按身份绑定），删会话不会动规划。
+    """
+    store = get_profile_store()
+    store.delete_conversation(conv_id, client_id=cid)
+    if st.session_state.get("agent_session_id") != conv_id:
+        st.rerun()
+    rest = [c for c in store.list_conversations(cid) if c["n_messages"] > 0]
+    if rest:
+        st.session_state["agent_session_id"] = rest[0]["id"]
+        st.session_state["agent_chat"] = _load_chat(rest[0]["id"])
     else:
-        st.caption(f"数据集：{data.get('split')} · {data.get('n_queries')} 题")
-        st.markdown(
-            "**评测口径**：ground truth 由 `题目 tags → 知识点 → 教材小节 → 该节全部 chunk` "
-            "构造，只取最匹配的**一个小节**。题目只在该题科目内匹配，并排除"
-            "「答案与解析 / 试题精选 / 复习提示」类小节（它们逐字含题干，会自匹配）。"
+        _new_id = uuid.uuid4().hex[:12]
+        store.create_conversation(cid, _new_id)
+        st.session_state["agent_session_id"] = _new_id
+        st.session_state["agent_chat"] = []
+    st.rerun()
+
+
+# 画像在顶部计算（规划看板的预填/加权要用）；渲染挪到文件末尾，
+# 这样当次提问/规划的事件能立刻反映在侧栏里。
+def _load_profile(events: list[dict] | None = None) -> dict:
+    from cs408rag.profile.stats import build_profile
+    from cs408rag.profile.store import get_profile_store
+
+    if events is None:
+        events = get_profile_store().events(cid)
+    return build_profile(events)
+
+
+def _summary_from_events(events: list[dict], *, period_label: str) -> str:
+    """基于一个时间窗口的事件生成学习总结文案。
+
+    优先用 LLM 生成有洞察的文案（system role + 强格式约束）；
+    未配置 LLM key 时降级为统计摘要。
+    """
+    from cs408rag.generation.llm import get_llm
+    from cs408rag.profile.stats import build_profile
+
+    if not events:
+        return f"{period_label}还没有学习记录。"
+    prof = build_profile(events)
+    data = {
+        "period": period_label,
+        "total_questions": prof["total_questions"],
+        "subject_counts": prof["subject_counts"],
+        "top_tags": prof["top_tags"][:8],
+        "quiz": prof["quiz"],
+        "recent_questions": prof["recent_questions"],
+    }
+    llm = get_llm()
+    if llm.available:
+        sys_prompt = (
+            "你是 408 考研备考助手。根据以下学习数据，生成一段简洁的学习情况总结。"
+            "严格按以下结构输出，不要加额外标题或解释性文字：\n"
+            "**覆盖情况**：（该周期提问次数、涉及科目、核心考点）\n"
+            "**薄弱信号**：（答错考点，如无则写暂无）\n"
+            "**下一步建议**：（1-2 条具体建议，针对薄弱或未覆盖的科目）"
         )
+        resp = llm.chat(
+            [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
+            ],
+            max_tokens=600,
+        )
+        if resp.ok and resp.text:
+            return resp.text
+    # 降级：统计摘要
+    lines = [f"**覆盖情况**：{period_label}提问 {data['total_questions']} 次"]
+    if data["subject_counts"]:
+        lines.append("涉及科目：" + "、".join(f"{s}×{n}" for s, n in data["subject_counts"].items()))
+    if data["top_tags"]:
+        lines.append("核心考点：" + "、".join(t["tag"] for t in data["top_tags"][:6]))
+    quiz = data["quiz"]
+    if quiz["total"]:
+        rate = quiz["correct"] / quiz["total"]
+        lines.append(f"**薄弱信号**：作答 {quiz['total']} 道，正确率 {rate:.0%}")
+        if quiz["wrong_tags"]:
+            lines.append("答错考点：" + "、".join(t["tag"] for t in quiz["wrong_tags"][:5]))
+    else:
+        lines.append("**薄弱信号**：暂无答题记录")
+    lines.append("**下一步建议**：针对薄弱考点多刷真题，兼顾未覆盖科目。")
+    return "\n".join(lines)
 
-        stages = data.get("stages", [])
-        if stages:
-            st.markdown("**检索链路递增消融**")
-            st.dataframe(stages, width="stretch")
 
-            st.markdown(
-                """
-#### 表格口径
+def _ensure_period_summaries(cid: str, events: list[dict] | None = None) -> None:
+    """检查并补齐最近一期周/月总结。
 
-- **Recall@10**：命中的相关 chunk 数 / 该题全部相关 chunk 数。
-- **Accuracy@10（题级命中）**：前 10 条里只要命中该题 GT 小节的任意 chunk 就算 1。
-  GT 小节常被切成 2–5 块，所以 Accuracy 通常高于 Recall。
-- **Precision@10** 天然偏低：GT 只是一个小节，10 条里通常只有 1–2 条来自该节。
-- **MRR / nDCG**：前者看第一个相关项排多前，后者看整体排序质量。
-"""
-            )
+    周总结覆盖上周一 00:00 ~ 上周日 23:59（周一生成上周）；
+    月总结覆盖上月 1 号 ~ 上月末（一号生成上月）。
+    只补最近一期，避免历史补生成刷屏。Streamlit 无后台进程，
+    所以在页面加载时触发——效果等同自动生成。
 
-            stage_notes = {
-                "S0_dense": (
-                    "仅稠密向量检索，基线",
-                    "作为所有增量的参照；它代表「只做语义召回」的上限。",
-                ),
-                "S1_hybrid": (
-                    "加入 BGE-M3 sparse + 图谱，RRF 融合",
-                    "主要增益来自 sparse 的术语精确匹配（+4.3pp）；图谱贡献很小，"
-                    "后面按题型拆开时甚至是负的。",
-                ),
-                "S1b_bm25": (
-                    "在 S1 上再加原生 BM25",
-                    "全题等权融合时 R@10 略降 0.56pp，但按题型选择后概念 +1.0pp、"
-                    "图表 +3.9pp，所以最终配置是「按题型决定是否启用」，不是全开。",
-                ),
-                "S2_rerank": (
-                    "加入 bge-reranker-v2-m3 交叉编码器重排",
-                    "负收益：R@10 −7.2pp、延迟 +246ms。固定候选集做纯重排也只 +0.0013 MRR，"
-                    "说明是重排器偏好与「概念讲解章节」这个相关性定义不一致。",
-                ),
-                "S3_rewrite": (
-                    "加入无 LLM 的轻量查询改写",
-                    "几乎无变化（+0.15pp），因为改写只做关键词分解，没有引入新信息。",
-                ),
-                "S4_filter": (
-                    "加入按科目过滤",
-                    "增量为 0：dense+sparse 本身已很少跨科误召回，过滤没有可去掉的噪声。",
-                ),
-                "PROD": (
-                    "最终生产配置：dense+sparse+BM25（按题型选）、去掉图谱、"
-                    "zscore 融合、小节去重、返回 10 条",
-                    "Accuracy@10 最高（0.668）、P50 最低（50ms），所以选它。"
-                    "它不是递增消融的一环，而是按题型消融后的组合。",
-                ),
-            }
-            st.markdown("#### 逐行解读")
-            for r in stages:
-                name = r.get("stage", "")
-                what, concl = stage_notes.get(name, ("", ""))
-                st.markdown(f"**{name}** — {what}")
-                st.markdown(
-                    f"结果：Recall@10 **{r.get('Recall@10', 0):.4f}** · "
-                    f"Accuracy@10 **{r.get('Accuracy@10', 0):.4f}** · "
-                    f"MRR {r.get('MRR@10', 0):.4f} · P50 {r.get('P50_ms', 0):.0f}ms"
-                )
-                st.markdown(f"结论：{concl}")
-
-            st.success(
-                "**最终为什么选 PROD**：问答场景要的是「有没有拿到正确小节」，"
-                "PROD 的 Accuracy@10 最高、延迟最低；如果产品改成「必须给多段原文」，"
-                "可以换回 RRF（chunk 级 Recall@10 更高），但题级命中会下降。"
-            )
-
-        fusions = data.get("fusions", [])
-        if fusions:
-            st.markdown("**融合策略对比**")
-            st.dataframe(fusions, width="stretch")
-            fusion_notes = {
-                "单路 dense（对照）": (
-                    "只用稠密向量，不融合",
-                    "R@10 最低（0.4731），但延迟也最低；用来回答「融合是否值得」。",
-                ),
-                "RRF (k=60)": (
-                    "只用各路排名做 RRF，k=60",
-                    "chunk 级 R@10 最高（0.5161）；对分数量纲不敏感，是纯检索场景的最优。",
-                ),
-                "RRF (k=20)": (
-                    "RRF 的 k 值敏感性对照",
-                    "与 k=60 几乎相同（0.5160），说明结果对该参数不敏感。",
-                ),
-                "加权融合 (minmax)": (
-                    "先 minmax 归一化分数再加权",
-                    "明显更差（0.4749，−3.7pp）：归一化后每路第 1 名都是 1.0，"
-                    "强命中和弱命中被拉平。",
-                ),
-                "加权融合 (zscore)": (
-                    "先 zscore 归一化分数再加权",
-                    "比 minmax 稳（0.5042），但仍略低于 RRF；MRR 反而更高。",
-                ),
-                "zscore + 节去重(1)": (
-                    "zscore 融合后，每个小节只保留 1 条",
-                    "chunk 级 R@10 降到 0.3546，但题级 Accuracy@10 最高（0.6327）——"
-                    "top-10 覆盖更多不同小节。生产以它为融合基础。",
-                ),
-                "zscore + 节去重(2)": (
-                    "每个小节保留 2 条",
-                    "折中：R@10 回升到 0.4537，但 Accuracy@10 降到 0.5819。",
-                ),
-            }
-            st.markdown("#### 逐行解读")
-            for r in fusions:
-                name = r.get("stage", "")
-                what, concl = fusion_notes.get(name, ("", ""))
-                st.markdown(f"**{name}** — {what}")
-                st.markdown(
-                    f"结果：Recall@10 **{r.get('Recall@10', 0):.4f}** · "
-                    f"Accuracy@10 **{r.get('Accuracy@10', 0):.4f}** · "
-                    f"MRR {r.get('MRR@10', 0):.4f} · P50 {r.get('P50_ms', 0):.0f}ms"
-                )
-                st.markdown(f"结论：{concl}")
-
-            st.success(
-                "**融合层的最终选择**：chunk 级召回最高的是 RRF；但问答要的是题级命中，"
-                "所以生产用 zscore + 节去重，再按题型决定是否加 BM25、并去掉图谱。"
-                "即链路表的 `PROD` 行。"
-            )
-
-        rescue = data.get("graph_rescue")
-        if rescue:
-            st.markdown("**图谱路长尾救援**")
-            st.json(rescue)
-            st.markdown(
-                f"""
-#### 信息解读
-
-- `hard_queries`：dense 与 sparse 的 top-k **都没有命中**任何相关 chunk 的题（{rescue.get('hard_queries', 0)} 道）。
-- `rescued_by_graph`：这些难题里，图谱路命中的数量（{rescue.get('rescued_by_graph', 0)} 道）。
-- `rescue_rate = rescued / hard`（{rescue.get('rescue_rate', 0):.1%}）。
-
-**结论：图谱作为通用召回路的增量很小**，且按题型拆开后对三类题都是负贡献，
-所以生产配置已移除图谱。它真正的价值在二期考点分析：
-知识点画像、同题考点共现、学习路径——这些不依赖检索召回。
-"""
-            )
-
-# ---------------------------------------------------------------------------
-# 对抗规划
-# ---------------------------------------------------------------------------
-with tab_adv:
-    import json
-    import math
-    import time
+    events 可选：复用外部已拉取的事件列表，避免重复查询。
+    """
     from datetime import date, timedelta
 
-    from cs408rag.adversarial.graph import PlanResult, PlanRunner
-    from cs408rag.adversarial.planner import SUBJECTS, next_exam_date, normalize_concerns
-    from cs408rag.adversarial.schema import plan_diff
+    from cs408rag.profile.store import get_profile_store
 
-    ADV_SUBJECTS = SUBJECTS
-    ADV_PROGRESS = ["未开始", "一轮中", "一轮完", "二轮中", "二轮完"]
-    ADV_CONCERN_TAGS = [
-        "基础差 / 跨考，看到代码就慌",
-        "时间不够，每天只能学 3–4 小时",
-        "做题慢，计算题总算错",
-        "某个知识点总错（可写具体知识点）",
-        "真题正确率低，不知道错在哪",
-        "记不住，背了又忘",
-        "不知道从哪开始",
+    store = get_profile_store()
+    today = date.today()
+    this_monday = today - timedelta(days=today.weekday())
+    last_monday = this_monday - timedelta(days=7)
+    last_sunday = this_monday - timedelta(days=1)
+    month_first = today.replace(day=1)
+    prev_month_last = month_first - timedelta(days=1)
+    prev_month_first = prev_month_last.replace(day=1)
+
+    all_events = events if events is not None else store.events(cid)
+
+    def _gen(period_type: str, period_date: date, start: date, end: date, label: str) -> None:
+        pds = period_date.isoformat()
+        if store.has_summary(cid, period_type, pds):
+            return
+        evs = [
+            e for e in all_events
+            if start.isoformat() <= e["ts"][:10] <= end.isoformat()
+        ]
+        content = _summary_from_events(evs, period_label=label)
+        store.save_summary(cid, period_type, pds, content)
+
+    with st.spinner("生成周期学习总结…"):
+        _gen(
+            "weekly", last_monday, last_monday, last_sunday,
+            f"{last_monday.isoformat()} 那周",
+        )
+        _gen(
+            "monthly", prev_month_first, prev_month_first, prev_month_last,
+            f"{prev_month_first.strftime('%Y年%m月')}",
+        )
+
+
+# 事件只拉一次，build_profile 与周期总结复用，避免重复查询。
+_all_events = get_profile_store().events(cid)
+profile = _load_profile(_all_events)
+
+# 周期总结：同一 cid 在本次会话生命周期内只检查/生成一次。
+# 新建会话、切换会话、发消息都会触发 rerun，若每次都跑且赶上 LLM 生成，
+# 会把整个页面阻塞几秒到十几秒（表现为"点击没反应"）。
+_sum_key = f"_summaries_checked_{cid}"
+if not st.session_state.get(_sum_key):
+    _ensure_period_summaries(cid, _all_events)
+    st.session_state[_sum_key] = True
+
+# ---------------------------------------------------------------------------
+# Agent 中枢主区（聊天）
+# ---------------------------------------------------------------------------
+
+def _load_chat(conv_id: str) -> list[dict]:
+    """从 DB 读取会话的聊天记录（只取 turn 消息）。"""
+    return [
+        m["content"]
+        for m in get_profile_store().load_messages(conv_id, client_id=cid)
+        if m["role"] == "turn"
     ]
 
-    st.subheader("对抗性 Plan Agent：日期驱动 + 高性价比考点")
-    st.caption(
-        "结构由真实真题统计计算（阶段 / 科目份额 / 考点 ROI / 周任务），"
-        "LLM 只把方法建议写顺。6 类挑战由纯函数规则判定，"
-        "是否继续修订由状态机决定，而模型没有「再聊聊」的权限。"
-    )
 
-    # 时间相关放在 form 外：改动后立即刷新预算，不必等提交
-    tc1, tc2, tc3 = st.columns(3)
-    with tc1:
-        adv_exam = st.date_input(
-            "考试日期",
-            value=next_exam_date(),
-            min_value=date.today() + timedelta(days=7),
-            key="adv_exam",
-            help="默认下一次考研（12 月 25 日前最后一个周六）",
-        )
-    with tc2:
-        adv_daily = st.number_input(
-            "每天 408 小时", 1.0, 12.0, 4.0, 0.5, key="adv_daily"
-        )
-    with tc3:
-        adv_days = st.slider("每周学习天数", 1, 7, 6, key="adv_days")
+def _activate_conversation(conv_id: str, chat: list[dict]) -> None:
+    """把某个会话设为当前会话（切换/新建共用的唯一入口）。"""
+    st.session_state["agent_session_id"] = conv_id
+    st.session_state["agent_chat"] = chat
+    # 上一个会话的重试/待提交提问不能带进新会话
+    st.session_state.pop("agent_pending", None)
 
-    _days = max(1, (adv_exam - date.today()).days)
-    _weeks = max(1, math.ceil(_days / 7))
-    _weekly = float(adv_daily) * int(adv_days)
-    st.info(
-        f"距 {adv_exam} 还有 **{_days} 天 ≈ {_weeks} 周**；"
-        f"每天 {adv_daily:g}h × 每周 {adv_days} 天 = **{_weekly:g}h/周**，"
-        f"总可用约 **{_weeks * _weekly:g}h**。"
-    )
 
-    with st.form("adv_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            adv_scope_label = st.radio(
-                "规划范围", ["全科 408", "单科补弱"], horizontal=True, key="adv_scope"
-            )
-        with c2:
-            adv_weak = st.multiselect(
-                "薄弱科目（建议 1–2 个）",
-                ADV_SUBJECTS,
-                default=["操作系统"],
-                max_selections=2,
-                key="adv_weak",
-            )
-        with c3:
-            adv_target = st.number_input("目标分", 60, 150, 115, key="adv_target")
+def _new_conversation(cid: str) -> None:
+    """新建会话并切换。
 
-        st.markdown("**四科当前进度**")
-        pc = st.columns(4)
-        adv_progress: dict[str, str] = {}
-        for i, subj in enumerate(ADV_SUBJECTS):
-            with pc[i]:
-                adv_progress[subj] = st.selectbox(
-                    subj, ADV_PROGRESS, index=1, key=f"adv_prog_{subj}"
-                )
+    用 on_click 回调而不是 if st.button 分支：回调在本次脚本渲染前执行，
+    新会话 ID / 空聊天记录一定先于主区渲染生效，不会出现
+    「记录建了、页面还显示上一个会话」。cid 由 args 显式传入，
+    不依赖回调里读脚本全局变量（那可能是上一次运行的旧值）。
+    """
+    _new_id = uuid.uuid4().hex[:12]
+    get_profile_store().create_conversation(cid, _new_id)
+    _activate_conversation(_new_id, [])
 
-        st.markdown("**你的备考问题**")
-        adv_concern_tags = st.multiselect(
-            "常见问题（可多选）",
-            ADV_CONCERN_TAGS,
-            key="adv_concern_tags",
-            help="会与下面的自由文本合并；每条问题都会在 Plan 里给出对应动作",
-        )
-        adv_concern_text = st.text_area(
-            "也可以直接写（每行一条，最多 8 条）",
-            placeholder="例：基础差，看到代码就慌\n真题正确率只有 50%\n死锁总是错",
-            height=110,
-            key="adv_concern_text",
-        )
 
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            adv_rounds = st.number_input("最大修订轮数", 0, 2, 2, key="adv_rounds")
-        with fc2:
-            adv_llm = st.checkbox(
-                "启用 LLM 文案（可选）",
-                value=False,
-                key="adv_llm",
-                help="结构 Plan 不依赖 LLM；勾选后只多一次调用润色经验贴，限流时自动退回模板",
-            )
-        with fc3:
-            st.caption("结构 Plan 不依赖 LLM；\nLLM 失败只退回模板文案。")
+def _switch_conversation(conv_id: str, cid: str) -> None:
+    """会话按钮回调：切换会话并加载历史。
 
-        submitted = st.form_submit_button("生成并质疑", type="primary")
+    用 on_click 而不是在 if st.button 分支里改 state —— 回调在脚本重跑前执行，
+    切换结果同一次 rerun 就生效，不会出现「点了没反应」。
+    """
+    chat = [
+        m["content"]
+        for m in get_profile_store().load_messages(conv_id, client_id=cid)
+        if m["role"] == "turn"
+    ]
+    _activate_conversation(conv_id, chat)
+    # 历史回灌放在提交时做（见 runner.rehydrate_session）：幂等且廉价，
+    # 点一下会话按钮不需要先把整套模型拉起来。
 
-    if submitted:
-        concerns = normalize_concerns(adv_concern_text)
-        for tag in adv_concern_tags:
-            if tag and tag not in concerns:
-                concerns.append(tag)
-        scope = "full_408" if adv_scope_label == "全科 408" else "single_subject"
-        weak = list(adv_weak)
-        if scope == "single_subject" and not weak:
-            weak = ["操作系统"]
-        goal = {
-            "scope": scope,
-            "weak_subjects": weak,
-            "start_date": date.today().isoformat(),
-            "exam_date": adv_exam.isoformat(),
-            "daily_hours": float(adv_daily),
-            "study_days_per_week": int(adv_days),
-            "target_score": int(adv_target),
-            "progress": adv_progress,
-            "concerns": concerns[:8],
-        }
-        runner = PlanRunner(use_llm=bool(adv_llm), max_rounds=int(adv_rounds))
-        placeholder = st.empty()
-        progress = st.progress(0.0, text="规划中…")
-        entries: list[dict] = []
-        last: dict = {}
-        before = runner.stats_snapshot()
-        t0 = time.perf_counter()
-        try:
-            for snapshot in runner.iter_run(goal):
-                last = snapshot
-                timeline = snapshot.get("timeline") or []
-                if len(timeline) != len(entries):
-                    entries = list(timeline)
-                    render_adv_timeline(entries, placeholder)
-                    progress.progress(
-                        min(0.95, len(entries) / 8),
-                        text=f"已完成 {len(entries)} 个节点…",
-                    )
-        finally:
-            progress.empty()
-        after = runner.stats_snapshot()
 
-        result = PlanResult(
-            goal=goal,
-            plan=last.get("plan") or {},
-            plan_history=last.get("plan_history") or [],
-            challenges=last.get("challenges") or [],
-            challenge_history=last.get("challenge_history") or last.get("challenges") or [],
-            timeline=last.get("timeline") or [],
-            stop_reason=last.get("stop_reason") or "",
-            version=int(last.get("version") or 0),
-            rounds=int(last.get("round") or 0),
-            llm_calls=int(last.get("llm_calls") or 0),
-            llm_errors=int(last.get("llm_errors") or 0),
-            planner_fallback=bool(last.get("planner_fallback")),
-            plan_source=str(last.get("plan_source") or "deterministic"),
-            guide_source=str(last.get("guide_source") or "template"),
-            role_models=runner.role_models,
-            tokens={
-                "prompt": after["prompt"] - before["prompt"],
-                "completion": after["completion"] - before["completion"],
-            },
-            error=str(last.get("error") or ""),
-            took_ms=(time.perf_counter() - t0) * 1000,
-        )
-        st.session_state["adv_result"] = result.to_dict()
+def _identity_switch(cid: str) -> None:
+    """身份入口：任何用户（包括还没建规划的）都要能看到并切换身份。
 
-    result = st.session_state.get("adv_result")
-    if not result:
-        st.info(
-            "填写条件后点击「生成并质疑」。结构 Plan 会立即生成；"
-            "启用 LLM 时只多花一次调用来润色经验贴文案。"
-        )
+    必须在渲染引导卡（内部 st.stop）之前调用，否则未规划用户
+    连切换身份的输入框都看不到。
+    """
+    cid_input = st.text_input(
+        "身份 ID（同一 ID 跨会话累积）", value=cid, key="cid_input"
+    ).strip()
+    if cid_input and cid_input != cid:
+        st.query_params["cid"] = cid_input
+        # 切换身份：清空上一个身份绑定的所有内存状态，
+        # 否则上一个身份的会话/规划/待确认 prompt 还会挂在页面上。
+        for _k in (
+            "agent_session_id",
+            "agent_chat",
+            plan_ui.RESULT_KEY,
+            plan_ui.USE_LLM_KEY,
+        ):
+            st.session_state.pop(_k, None)
+        st.rerun()
+
+
+# 会话状态：session_id + 本地渲染用的聊天记录（持久化到 profile.db，刷新不丢）
+if "agent_session_id" not in st.session_state:
+    # 优先复用最近一个「有消息」的会话；没有历史内容时复用已有的空会话；
+    # 都没有才新建——避免每次新开标签页都造一条空记录，把侧栏刷成一串会话。
+    _convs_all = get_profile_store().list_conversations(cid)
+    _nonempty = [c for c in _convs_all if c["n_messages"] > 0]
+    if _nonempty:
+        st.session_state["agent_session_id"] = _nonempty[0]["id"]
+    elif _convs_all:
+        st.session_state["agent_session_id"] = _convs_all[0]["id"]
     else:
-        plan = result.get("plan") or {}
-        g = plan.get("goal") or {}
-        stop = result.get("stop_reason") or ""
-        stages = plan.get("stages") or []
-        kps = plan.get("priority_kps") or []
-        actions = plan.get("concern_actions") or []
-        weekly = plan.get("weekly_plan") or []
-        guide = plan.get("guide") or {}
+        _sid = uuid.uuid4().hex[:12]
+        get_profile_store().create_conversation(cid, _sid)
+        st.session_state["agent_session_id"] = _sid
+if "agent_chat" not in st.session_state:
+    st.session_state["agent_chat"] = _load_chat(
+        st.session_state["agent_session_id"]
+    )
 
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("退出原因", ADV_STOP_LABELS.get(stop, stop or "—"))
-        m2.metric("剩余周数", g.get("remaining_weeks", "—"))
-        m3.metric("总可用小时", f"{g.get('total_hours', 0):g}")
-        m4.metric("Plan 版本", result.get("version", 0))
-        m5.metric("残留 high", len(result.get("open_high") or []))
-        m6.metric("耗时", f"{(result.get('took_ms') or 0) / 1000:.1f}s")
+# 身份入口先于「无规划 st.stop」渲染：未规划用户也要能切回自己的身份。
+# st.stop 只挡聊天区，已渲染的侧栏内容不受影响。
+with st.sidebar:
+    st.header("💬 会话")
+    _identity_switch(cid)
 
-        st.caption(
-            f"每天 {g.get('daily_hours', '?')}h × {g.get('study_days_per_week', '?')} 天 "
-            f"= {g.get('weekly_hours', '?')}h/周 ｜ 考试 {g.get('exam_date')} ｜ "
-            f"范围 {g.get('scope')} ｜ 结构 {result.get('plan_source')} ｜ "
-            f"文案 {result.get('guide_source')} ｜ LLM {result.get('llm_calls', 0)} 次 ｜ "
-            f"token {(result.get('tokens') or {}).get('prompt', 0)} + "
-            f"{(result.get('tokens') or {}).get('completion', 0)}"
+# 当前规划：落库读取 + 首次严格引导（无规划时模块内部 st.stop()）
+plan_ui.load_saved(cid)
+plan_ui.render_onboarding(cid, profile)
+
+top_l, top_r = st.columns([3, 1])
+top_l.caption(f"会话 `{st.session_state['agent_session_id']}`")
+top_r.button(
+    "新会话",
+    key="agent_new_session",
+    on_click=_new_conversation,
+    args=(cid,),
+    use_container_width=True,
+)
+
+# 新会话是空页：明确提示「已经切过来了」，避免看起来像没反应
+if not st.session_state["agent_chat"]:
+    st.info("新会话已开始，直接提问即可。")
+
+
+# 历史渲染：用户问句 + 回答 + 每轮元信息与推理链
+for mi, msg in enumerate(st.session_state["agent_chat"]):
+    with st.chat_message("user"):
+        st.markdown(msg["q"])
+    with st.chat_message("assistant"):
+        d = msg["d"]
+        if d.get("resolved_query"):
+            st.caption(f"已按上轮语境改写为：{d['resolved_query']}")
+        if d.get("answer"):
+            st.markdown(d["answer"])
+        else:
+            # 无答案时不能一律显示「未知原因」：按 stop_reason 给出可区分的提示
+            _icon, _text = _stop_reason_view(
+                d.get("stop_reason"), d.get("error")
+            )
+            st.markdown(f"{_icon} **{_text}**")
+            if d.get("stop_reason") == "tool_error":
+                if st.button("🔁 重试这一问", key=f"retry_stop_{mi}"):
+                    st.session_state["agent_pending"] = msg["q"]
+                    st.rerun()
+        # 考情类回答内嵌客观统计图（数据来自 get_exam_stats 工具输出，非模型预测）
+        es = (d.get("tool_outputs") or {}).get("exam_stats")
+        if isinstance(es, dict) and es.get("total"):
+            st.caption(
+                f"📊 「{es.get('tag')}」历年考查 {es['total']} 次"
+                f"（{len(es.get('matched_tags') or [])} 个标签）· 客观计数"
+            )
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                st.caption("年份分布")
+                st.bar_chart({"次数": {str(y): n for y, n in (es.get("by_year") or {}).items()}})
+            with ec2:
+                st.caption("题型分布")
+                st.bar_chart({"次数": es.get("by_type") or {}})
+        v = d.get("verification") or {}
+        cost = f" · ¥{d['cost_cny']:.4f}" if d.get("cost_cny") else ""
+        steps = d.get("steps") or []
+        rt = d.get("route") or ""
+        rlabel, rdesc = ROUTE_LABELS.get(rt, (rt or "—", ""))
+        rreason = next(
+            (
+                str(s.get("detail", {}).get("reason") or "")
+                for s in steps
+                if s.get("node") == "route"
+            ),
+            "",
         )
-        if result.get("error"):
-            st.error(result["error"])
-        if result.get("planner_fallback"):
-            st.warning("结构 Plan 生成失败，已使用兜底；本次结果不可信。")
-        if result.get("guide_source") == "template" and result.get("llm_calls"):
-            st.caption("LLM 文案未通过校验（空回答 / 含资料名 / 结构不合法），已使用模板文案。")
-
-        st.markdown("**阶段路线**")
-        if stages:
+        flow = " → ".join(dict.fromkeys(str(s.get("node")) for s in steps))
+        st.markdown(
+            f"**🤖 Agent 执行过程** · 路由「{rlabel}」——{rreason or rdesc}"
+        )
+        st.caption(
+            f"链路 {flow or '—'} · {d.get('took_ms', 0) / 1000:.1f}s · "
+            f"工具 {d.get('n_tool_calls', 0)} 次/{d.get('rounds', 0)} 轮 · "
+            f"停止原因 {_stop_reason_view(d.get('stop_reason'))[1]}{cost}"
+        )
+        tool_calls = d.get("tool_calls") or []
+        if tool_calls:
+            for t in tool_calls:
+                icon = "✅" if t["ok"] else "❌"
+                st.markdown(
+                    f"&nbsp;&nbsp;{icon} **{TOOL_LABELS.get(t['tool'], t['tool'])}**"
+                    f" `{t['tool']}` · {t['took_ms']:.0f}ms · {t['summary']}"
+                )
+            st.caption(
+                "以上工具全部是确定性实现（检索 / 统计 / 计算器 / 图形解析），"
+                "LLM 只负责决定调谁和最终成文。"
+            )
+        else:
+            st.caption("本轮未调用工具。")
+        if v:
+            if v.get("ok"):
+                st.caption("✅ 答案校验通过（引用与真题编号均有效、无押题表述）")
+            else:
+                problems = []
+                if v.get("invalid_exam_refs"):
+                    problems.append(f"无效真题编号 {v['invalid_exam_refs']}")
+                if v.get("predictions"):
+                    problems.append(f"命中押题表述 {v['predictions'][:3]}")
+                st.caption("⚠️ 校验未通过：" + "；".join(problems))
+        with st.expander("步骤耗时明细"):
             st.dataframe(
                 [
                     {
-                        "阶段": s.get("name"),
-                        "开始": s.get("start"),
-                        "结束": s.get("end"),
-                        "周数": s.get("weeks"),
-                        "重点": "、".join(s.get("focus") or []),
-                        "交付物": "；".join(s.get("deliverables") or []),
-                        "检查点": s.get("checkpoint"),
+                        "步骤": s["node"],
+                        "耗时(ms)": s["took_ms"],
+                        "详情": json.dumps(s.get("detail", {}), ensure_ascii=False)[:160],
                     }
-                    for s in stages
+                    for s in steps
                 ],
                 width="stretch",
-                hide_index=True,
             )
-
-        t1, t2, t3, t4, t5 = st.tabs(
-            ["高性价比知识点", "你的问题 → 计划", "周计划", "经验贴 / 方法", "修订与挑战"]
-        )
-
-        with t1:
-            st.caption(
-                "ROI 是「频次 + 近 5 年 + 计算/图表占比 + 学习成本」的启发式排序，"
-                "不是押题。展开可看教材小节与子考点。"
-            )
-            if kps:
-                subj_filter = st.multiselect(
-                    "科目筛选",
-                    ADV_SUBJECTS,
-                    default=ADV_SUBJECTS,
-                    key="adv_kp_subj",
-                )
-                shown_kps = [
-                    k for k in kps if not subj_filter or k.get("subject") in subj_filter
-                ]
-                st.dataframe(
-                    [
-                        {
-                            "科目": k.get("subject"),
-                            "考点": k.get("tag"),
-                            "频次": k.get("frequency"),
-                            "近5年": k.get("recent_5y"),
-                            "题型": _types_text(k.get("types")),
-                            "ROI": f"{k.get('roi_label')} ({k.get('roi'):.2f})",
-                            "优先学": "、".join(k.get("must_learn") or []),
-                            "证据": "、".join(k.get("evidence") or []),
-                        }
-                        for k in shown_kps
-                    ],
-                    width="stretch",
-                    hide_index=True,
-                )
-                for k in shown_kps[:15]:
-                    with st.expander(
-                        f"[{k.get('roi_label')}] {k.get('subject')} · {k.get('tag')} "
-                        f"· 共 {k.get('frequency')} 次 / 近5年 {k.get('recent_5y')} 次"
-                    ):
-                        st.write(k.get("why"))
-                        st.caption(
-                            "教材小节：" + ("、".join(k.get("kp_titles") or []) or "—")
-                        )
-                        if k.get("must_learn"):
-                            st.markdown("**优先学**：" + "、".join(k["must_learn"]))
-                        if k.get("later"):
-                            st.markdown("**可后置**：" + "、".join(k["later"]))
-                        if k.get("subtopics"):
-                            st.dataframe(
-                                [
-                                    {
-                                        "子考点": s.get("tag"),
-                                        "频次": s.get("frequency"),
-                                        "题型": _types_text(s.get("types")),
-                                    }
-                                    for s in k["subtopics"]
-                                ],
-                                width="stretch",
-                                hide_index=True,
-                            )
-            else:
-                st.caption("没有选中考点。")
-
-        with t2:
-            if actions:
-                st.dataframe(
-                    [
-                        {
-                            "你的问题": a.get("concern"),
-                            "诊断": a.get("diagnosis"),
-                            "计划怎么解决": a.get("action"),
-                            "阶段": a.get("stage"),
-                            "检查点": a.get("checkpoint"),
-                        }
-                        for a in actions
-                    ],
-                    width="stretch",
-                    hide_index=True,
-                )
-            else:
-                st.caption("没有填写备考问题；可以在表单里自由描述，系统会逐条映射成动作。")
-
-        with t3:
-            if weekly:
-                st.caption("每周总小时 = 表单预算；任务都带「学什么 / 怎么学 / 验收标准」。")
-                st.dataframe(
-                    [
-                        {
-                            "周": w.get("week"),
-                            "阶段": w.get("stage"),
-                            "本周主攻": "、".join(w.get("focus") or []),
-                            "科目": t.get("subject"),
-                            "小时": t.get("hours"),
-                            "知识点": "、".join(t.get("kps") or []),
-                            "学什么": t.get("content"),
-                            "怎么学": t.get("method"),
-                            "验收标准": t.get("acceptance"),
-                        }
-                        for w in weekly
-                        for t in (w.get("tasks") or [])
-                    ],
-                    width="stretch",
-                    hide_index=True,
-                )
-            else:
-                st.caption("没有周计划。")
-
-        with t4:
-            if guide.get("overview"):
-                st.markdown(f"**总览**\n\n{guide['overview']}")
-            if guide.get("note"):
-                st.caption(guide["note"])
-            if guide.get("subject_order"):
-                st.markdown(f"**起步顺序**\n\n{guide['subject_order']}")
-            pa = guide.get("phase_advice") or []
-            if pa:
-                st.markdown("**阶段建议**")
-                for p in pa:
-                    st.markdown(f"- **{p.get('stage')}**：{p.get('advice')}")
-            ss = guide.get("subject_strategy") or []
-            if ss:
-                st.markdown("**分科策略**")
-                for s in ss:
+        reco = msg.get("reco") or []
+        if reco:
+            st.markdown("**📎 相关真题**（先自测再看答案；作答会同步错题本与画像）")
+            for q in reco:
+                with st.container(border=True):
                     st.markdown(
-                        f"- **{s.get('subject')}**：{s.get('strategy')}"
-                        + (
-                            "｜注意：" + "；".join(s.get("pitfalls") or [])
-                            if s.get("pitfalls")
-                            else ""
-                        )
+                        f"**[{q['qid']}]** {q['subject']} · {q.get('type') or '—'} "
+                        f"· 出处：{q['year']} 年 408 第 {q['num']} 题"
+                        + (f" · [原题链接]({q['url']})" if q.get("url") else "")
                     )
-            if guide.get("weekly_routine"):
-                st.markdown(f"**每周节奏**\n\n{guide['weekly_routine']}")
-            if guide.get("pitfalls"):
-                st.markdown("**常见坑**")
-                for p in guide["pitfalls"]:
-                    st.markdown(f"- {p}")
-            if guide.get("checkpoints"):
-                st.markdown("**检查点**")
-                for p in guide["checkpoints"]:
-                    st.markdown(f"- {p}")
-            st.caption("按你的选择：经验贴只写方法，不推荐教材 / 网课 / 老师。")
+                    st.write(q["question"])
+                    for k, v in (q.get("options") or {}).items():
+                        st.markdown(f"- **{k}.** {v}")
+                    with st.expander("参考答案与解析"):
+                        st.markdown(f"**答案：{q['answer']}**")
+                        if q.get("explanation"):
+                            st.caption(q["explanation"])
+                        _quiz_feedback(q, mi)
+        if d.get("needs_clarification"):
+            st.markdown("**选一个继续：**")
+            for i, opt in enumerate(d.get("clarification_options") or []):
+                if st.button(
+                    opt, key=f"clarify_{mi}_{i}", width="stretch"
+                ):
+                    st.session_state["agent_pending"] = opt
+                    st.rerun()
 
-        with t5:
-            challenges = result.get("challenge_history") or result.get("challenges") or []
-            open_n = sum(1 for c in challenges if c.get("status", "open") == "open")
-            resolved_n = sum(1 for c in challenges if c.get("status") == "resolved")
-            st.caption(
-                f"共 {len(challenges)} 条挑战 · 已解决 {resolved_n} · 仍开放 {open_n}"
-                "（已解决的挑战保留在轨迹里）"
-            )
-            rule_labels = {
-                "fabricated_ref": "编造真题编号",
-                "time_overrun": "周学时超支",
-                "missing_high_freq_kp": "漏掉高频考点",
-                "prerequisite_order": "前置顺序颠倒",
-                "uncited_priority": "高权重无引用",
-                "weak_subject_underweight": "薄弱科目占比不足",
-                "llm_critic": "LLM 主观挑战",
-            }
-            if challenges:
-                sev = st.multiselect(
-                    "按严重度筛选",
-                    ["high", "medium", "low"],
-                    default=["high", "medium", "low"],
-                    key="adv_sev",
-                )
-                shown = [c for c in challenges if c.get("severity") in sev]
-                st.dataframe(
-                    [
-                        {
-                            "类型": rule_labels.get(c.get("rule"), c.get("rule")),
-                            "严重度": c.get("severity"),
-                            "位置": c.get("locator") or c.get("evidence_ref") or "",
-                            "问题": c.get("message"),
-                            "状态": c.get("status", "open"),
-                            "裁定": c.get("verdict") or "",
-                        }
-                        for c in shown
-                    ],
-                    width="stretch",
-                    hide_index=True,
-                )
-                for c in shown[:20]:
-                    with st.expander(
-                        f"[{c.get('severity')}] {rule_labels.get(c.get('rule'), c.get('rule'))}"
-                        f" · {c.get('locator') or c.get('evidence_ref') or ''}"
-                    ):
-                        st.write(c.get("message"))
-                        if c.get("evidence"):
-                            st.json(c["evidence"])
-                        if c.get("evidence_ref"):
-                            st.caption(f"证据路径：`{c['evidence_ref']}`")
-                        if c.get("fix"):
-                            st.caption(f"建议：{c['fix']}")
-            else:
-                st.success("没有挑战。")
-
-            history = result.get("plan_history") or []
-            st.markdown("**修订 diff**")
-            if len(history) >= 2:
-                st.code(plan_diff(history[0], history[-1]), language="diff")
-            else:
-                st.caption("只有 1 版 Plan，没有可展示的修订。")
-
-        st.download_button(
-            "下载完整结果 JSON",
-            data=json.dumps(result, ensure_ascii=False, indent=2),
-            file_name="adversarial_plan.json",
-            mime="application/json",
+# 澄清按钮的点击结果与手动输入走同一条发送路径
+pending = st.session_state.pop("agent_pending", None)
+prompt = pending or st.chat_input(
+    "提问、追问，或「帮我规划复习」「我的画像」"
+)
+if prompt:
+    # 规划意图：弹条件确认框（HITL），确认后在 dialog 内生成独立规划记录
+    if plan_ui.wants_plan(prompt):
+        plan_ui.open_dialog(cid, profile)
+    else:
+        runner = get_runner()
+        # 每轮都做一次增量回灌（幂等）：切会话、刷新、多标签都以落库历史为准，
+        # 不再依赖一次性的标记——标记会在 rerun / 异常后丢掉。
+        runner.rehydrate_session(
+            st.session_state["agent_session_id"],
+            st.session_state["agent_chat"],
+            client_id=cid,
         )
+        with st.spinner("Agent 执行中（含 LLM 生成，通常 10–60 秒）…"):
+            res = runner.run(
+                prompt,
+                session_id=st.session_state["agent_session_id"],
+                client_id=cid,
+            )
+        msg: dict = {"q": prompt, "d": res.to_dict()}
+        plan_out = (msg["d"].get("tool_outputs") or {}).get("plan_result")
+        if plan_out:
+            # 看板与画像事件同一事务写入（由规划模块统一处理）
+            plan_ui.apply_agent_plan(cid, plan_out)
+        reco_text = (
+            f"{msg['d'].get('resolved_query') or ''} {prompt} {msg['d'].get('answer') or ''}"
+        )
+        if msg["d"].get("route") == "plan":
+            msg["reco"] = []
+        else:
+            msg["reco"] = _recommend_questions(reco_text)
+        _record_question(prompt)
+        st.session_state["agent_chat"].append(msg)
+
+        _conv_id = st.session_state["agent_session_id"]
+        get_profile_store().append_message(_conv_id, "turn", msg, client_id=cid)
+        if len(st.session_state["agent_chat"]) == 1:
+            get_profile_store().set_conversation_title(
+                _conv_id, prompt, client_id=cid
+            )
+        st.rerun()
+
+# ---------------------------------------------------------------------------
+# 侧栏：会话列表 + 学习总结（系统自动生成，用户无需操作）
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    # 身份入口已提前渲染（见 _identity_switch），这里只放会话与总结。
+    # 当前规划 + 重新制定：规划模块统一渲染
+    plan_ui.render_sidebar(cid, profile)
+
+    st.button(
+        "➕ 新建会话",
+        key="sb_new_conv",
+        use_container_width=True,
+        on_click=_new_conversation,
+        args=(cid,),
+    )
+
+    _cur = st.session_state.get("agent_session_id")
+    _all_convs = get_profile_store().list_conversations(cid)
+    # 只展示有消息的会话 + 当前会话，避免空会话把列表刷成一串「（空会话）」
+    _convs = [
+        c for c in _all_convs if c["n_messages"] > 0 or c["id"] == _cur
+    ]
+    # 当前会话置顶：默认按更新时间排序，切到旧会话后它会留在列表深处，
+    # 看起来像「没切过来」；置顶后当前会话永远在第一屏。
+    _convs = sorted(_convs, key=lambda c: c["id"] != _cur)
+
+    # 会话列表默认只显示最近 8 条：条数一多会把下方「学习总结」挤出几屏。
+    _CONV_LIMIT = 8
+    _expand = bool(st.session_state.get("_conv_expand"))
+    _shown = _convs if _expand else _convs[:_CONV_LIMIT]
+
+    if not _convs:
+        st.caption("暂无会话，提问后会自动保存")
+    for _c in _shown:
+        _title = _c["title"] or "（未命名会话）"
+        # 单行按钮会静默截断长标题，这里显式截断并用 tooltip 给出完整标题
+        _label = _title if len(_title) <= 18 else _title[:18] + "…"
+        _is_cur = _c["id"] == _cur
+        # 用横向容器而不是 columns：窄窗口下 columns 会把删除按钮折到下一行，
+        # 每行变成两行高，会话一多就把下半部分全挤走。
+        with st.container(
+            horizontal=True,
+            wrap=False,
+            vertical_alignment="center",
+            gap="small",
+        ):
+            # 当前会话也允许点击（重复加载历史），用 ● 与 primary 样式标出
+            st.button(
+                f"{'● ' if _is_cur else ''}{_label}",
+                key=f"conv_{_c['id']}",
+                help=_title,
+                width="stretch",
+                type="primary" if _is_cur else "secondary",
+                on_click=_switch_conversation,
+                args=(_c["id"], cid),
+            )
+            if st.button(
+                "🗑",
+                key=f"del_{_c['id']}",
+                help="删除这个会话（规划是独立记录，不受影响）",
+            ):
+                _delete_conversation(_c["id"])
+
+    if len(_convs) > _CONV_LIMIT and st.button(
+        "收起会话列表" if _expand else f"显示全部 {len(_convs)} 个会话",
+        key="sb_conv_toggle",
+        use_container_width=True,
+    ):
+        st.session_state["_conv_expand"] = not _expand
+        st.rerun()
+
+    # 空会话在侧栏已隐藏，但 DB 里会随刷新累积，给一个手动清理入口。
+    _n_empty = sum(
+        1 for c in _all_convs if c["n_messages"] == 0 and c["id"] != _cur
+    )
+    if _n_empty:
+        if st.button(
+            f"🧹 清理 {_n_empty} 个空会话",
+            key="sb_clean_empty",
+            use_container_width=True,
+        ):
+            get_profile_store().delete_empty_conversations(cid, keep_id=_cur)
+            st.rerun()
+
+    st.divider()
+    st.header("📊 学习总结")
+    st.caption("每周一生成上周总结、每月 1 号生成上月总结，点击日期查看")
+
+    _weekly = get_profile_store().list_summaries(cid, "weekly")
+    _monthly = get_profile_store().list_summaries(cid, "monthly")
+
+    if _weekly:
+        st.markdown("**周总结**")
+        # 只列最近 4 期，避免时间一长侧栏被日期列表占满；更早的收进折叠区。
+        # Streamlit 不支持 expander 嵌套，所以折叠区里用标题 + 正文分段。
+        for _s in _weekly[:4]:
+            with st.expander(f"📅 {_s['period_date']} 那周", expanded=False):
+                st.markdown(_s["content"])
+        if len(_weekly) > 4:
+            with st.expander(f"📂 更早的 {len(_weekly) - 4} 期周总结", expanded=False):
+                for _s in _weekly[4:]:
+                    st.markdown(f"**{_s['period_date']} 那周**")
+                    st.markdown(_s["content"])
+                    st.divider()
+    else:
+        st.caption("暂无周总结（上周学习后自动生成）")
+
+    if _monthly:
+        st.markdown("**月总结**")
+        for _s in _monthly[:3]:
+            ym = _s["period_date"][:7].replace("-", "年") + "月"
+            with st.expander(f"📅 {ym}", expanded=False):
+                st.markdown(_s["content"])
+        if len(_monthly) > 3:
+            with st.expander(f"📂 更早的 {len(_monthly) - 3} 期月总结", expanded=False):
+                for _s in _monthly[3:]:
+                    ym = _s["period_date"][:7].replace("-", "年") + "月"
+                    st.markdown(f"**{ym}**")
+                    st.markdown(_s["content"])
+                    st.divider()
+    else:
+        st.caption("暂无月总结（上月学习后自动生成）")
+

@@ -304,14 +304,17 @@ def agent_quiz_messages(
     options: dict[str, str],
     blocks: Sequence[ContextBlock],
     evidence: dict | None = None,
+    history: str = "",
 ) -> list[dict[str, str]]:
     """Agent 路径的选择题。最后一行仍必须是 `答案：X`，保证与一期评测口径一致。"""
     opts = "\n".join(f"{k}. {v}" for k, v in options.items())
     if not opts:
         opts = "（选项未以文字给出，见题干或配图；请根据图形解析判断 A/B/C/D）"
     ev = render_evidence(evidence or {})
+    hist = f"【对话历史】\n{history}\n\n" if history else ""
     user = (
-        f"【参考资料】\n{render_context(blocks)}\n\n"
+        hist
+        + f"【参考资料】\n{render_context(blocks)}\n\n"
         + (f"{ev}\n\n" if ev else "")
         + f"【题目】\n{question}\n\n"
         f"【选项】\n{opts}\n\n"
@@ -330,10 +333,13 @@ def agent_qa_messages(
     question: str,
     blocks: Sequence[ContextBlock],
     evidence: dict | None = None,
+    history: str = "",
 ) -> list[dict[str, str]]:
     ev = render_evidence(evidence or {})
+    hist = f"【对话历史】\n{history}\n\n" if history else ""
     user = (
-        f"【参考资料】\n{render_context(blocks)}\n\n"
+        hist
+        + f"【参考资料】\n{render_context(blocks)}\n\n"
         + (f"{ev}\n\n" if ev else "")
         + f"【问题】\n{question}\n\n"
         "请依据参考资料与工具结论作答，并用 [编号] 标注依据来源。"
@@ -350,9 +356,12 @@ def agent_exam_messages(
     example_questions: Sequence[dict],
     related: Sequence[dict] | None = None,
     learning_path: dict | None = None,
+    history: str = "",
 ) -> list[dict[str, str]]:
     """备考咨询：在 exam_analysis_messages 基础上补关联考点与前置链。"""
     msgs = exam_analysis_messages(topic, stats, example_questions)
+    if history:
+        msgs[1]["content"] = f"【对话历史】\n{history}\n\n" + msgs[1]["content"]
     if related:
         rel = "、".join(f"{r['tag']}（共现{r['cooccurrence']}次）" for r in related[:8])
         msgs[1]["content"] += f"\n\n【关联考点（真题共现）】{rel}"

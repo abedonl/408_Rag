@@ -132,6 +132,7 @@ class LLMClient:
         temperature: float = 0.0,
         max_tokens: int = 1024,
         json_mode: bool = False,
+        timeout: float | None = None,
     ) -> LLMResponse:
         if not self.available:
             return LLMResponse(
@@ -151,6 +152,9 @@ class LLMClient:
                 if json_mode:
                     kw["response_format"] = {"type": "json_object"}
                 kw.update(self._extra_body())
+                if timeout:
+                    # 单次覆盖：规划类长 prompt 在默认超时内跑不完
+                    kw["timeout"] = timeout
                 resp = self._ensure().chat.completions.create(
                     model=self.model,
                     messages=messages,  # type: ignore[arg-type]
@@ -179,7 +183,7 @@ class LLMClient:
                     and not budget_bumped
                 ):
                     budget_bumped = True
-                    effective_max = min(effective_max * 2, 3200)
+                    effective_max = min(effective_max * 2, 6000)
                     logger.warning(
                         f"模型返回空正文（completion={out.completion_tokens}，"
                         f"可能是思考 token 吃光预算），max_tokens 提到 {effective_max} 重试"

@@ -121,6 +121,11 @@ def _guide_context(plan: dict[str, Any]) -> str:
 
 
 class Planner:
+    # 经验贴文案改写默认关闭：这套模型（agnes-3.0-flash）思考 token 占地大，
+    # 实测改写耗时 90s+ 且仍回退模板，性价比不如直接用模板文案。
+    # 每周理由（_enrich_weekly）仍然走 LLM，那才是「Agent 参与」的部分。
+    ENRICH_GUIDE = False
+
     def __init__(
         self, llm: LLMClient | None = None, analyzer: ExamAnalyzer | None = None
     ) -> None:
@@ -158,16 +163,125 @@ class Planner:
             prev_meta = prev_plan.get("meta") or {}
             plan["guide"] = prev_plan["guide"]
             plan["meta"]["guide_source"] = prev_meta.get("guide_source", "template")
+            # 每周理由同样复用：结构条数通常不变，重新调 LLM 只会白烧预算。
+            prev_reasons = {
+                int(w.get("week")): w.get("reason")
+                for w in (prev_plan.get("weekly_plan") or [])
+                if isinstance(w, dict)
+                and isinstance(w.get("week"), (int, float))
+                and w.get("reason")
+            }
+            for week in plan.get("weekly_plan") or []:
+                w_no = week.get("week")
+                if isinstance(w_no, (int, float)) and prev_reasons.get(int(w_no)):
+                    week["reason"] = prev_reasons[int(w_no)]
+            if prev_reasons:
+                plan["meta"]["weekly_source"] = prev_meta.get("weekly_source", "llm")
             return plan, False
 
-        guide = self._enrich_guide(plan, challenges)
-        plan["meta"]["guide_attempted"] = True
+        guide = self._enrich_guide(plan, challenges) if self.ENRICH_GUIDE else None
+        plan["meta"]["guide_attempted"] = self.ENRICH_GUIDE
+        used_llm = False
         if guide:
             plan["guide"] = guide
             plan["meta"]["guide_source"] = "llm"
             plan["meta"]["plan_source"] = "llm_enriched"
-            return plan, True
-        return plan, False
+            used_llm = True
+
+        # 每周一句「为什么这么排」：只补 reason 字段，不改小时/考点/阶段，
+        # 这样相邻周不会因为骨架兜底而读起来完全一样。
+        reasons = self._enrich_weekly(plan)
+        if reasons:
+            for week in plan.get("weekly_plan") or []:
+                w_no = week.get("week")
+                r = reasons.get(int(w_no)) if isinstance(w_no, (int, float)) else None
+                if r:
+                    week["reason"] = r
+            plan["meta"]["weekly_source"] = "llm"
+            used_llm = True
+        return plan, used_llm
+
+    def _enrich_weekly(self, plan: dict[str, Any]) -> dict[int, str] | None:
+        """让 LLM 为每一周写一句推进逻辑，返回 {周次: 理由}。
+
+        输入只给已算好的骨架（周次/阶段/小时/考点），输出也只要理由文本，
+        数字与考点一律不经过 LLM，规则校验仍对原结构生效。
+        """
+        weeks = plan.get("weekly_plan") or []
+        if not weeks:
+            return None
+        goal = plan.get("goal") or {}
+        out: dict[int, str] = {}
+        # 分批生成：一次让模型写全部周理由会被输出预算截断（实测返回残缺 JSON）；
+        # 只给前 8 周写理由，后续周在看板里本就折叠，避免每次规划多等 1 分钟。
+        for start in range(0, min(len(weeks), 8), 8):
+            chunk = weeks[start : start + 8]
+            lines: list[str] = []
+            for w in chunk:
+                focus = "、".join(w.get("focus") or []) or "全部科目"
+                parts: list[str] = []
+                for t in w.get("tasks") or []:
+                    kps = "、".join((t.get("kps") or [])[:3])
+                    parts.append(
+                        f"{t.get('subject')}{float(t.get('hours') or 0):g}h "
+                        f"{kps + '：' if kps else ''}{str(t.get('content') or '')[:40]}"
+                    )
+                lines.append(
+                    f"第{w.get('week')}周[{w.get('stage')}] 主攻{focus}｜"
+                    + "；".join(parts)
+                )
+            user = [
+                f"范围 {goal.get('scope')}，薄弱科目 "
+                f"{'、'.join(goal.get('weak_subjects') or []) or '无'}，"
+                f"用户问题 {'、'.join(goal.get('concerns') or []) or '无'}。",
+                "下面是已算好的每周骨架（周次、阶段、小时、考点不可修改）：",
+                "\n".join(lines),
+                "为每一周写一句 20–45 字的「本周为什么这么排」：",
+                "1. 点出这一周的推进逻辑（新学→巩固→二刷→真题→模考的递进）；",
+                "2. 相邻周的措辞不得重复；",
+                "3. 不要罗列小时数或考点名单，不推荐教材、网课、老师；",
+                '4. 严格输出 JSON：{"weeks":[{"week":1,"reason":"..."}]}',
+            ]
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是 408 备考规划师。只解释每周安排的理由，"
+                        "不编造数字、真题号或频次，只输出 JSON。"
+                    ),
+                },
+                {"role": "user", "content": "\n".join(user)},
+            ]
+            resp = self.guide_llm.chat(
+                messages, max_tokens=4000, json_mode=True, timeout=90
+            )
+            if not resp.ok:
+                logger.warning(
+                    f"Planner weekly 调用失败，跳过本批理由：{resp.error[:120]}"
+                )
+                continue
+            obj = _extract_json(resp.text)
+            if not obj:
+                logger.warning("Planner weekly 不是合法 JSON，跳过本批理由")
+                continue
+            text = json.dumps(obj, ensure_ascii=False)
+            if any(term in text for term in FORBIDDEN_GUIDE_TERMS):
+                logger.warning("Planner weekly 提到了资料/网课/老师，跳过本批理由")
+                continue
+            if re.search(r"20\d{2}#\d+", text):
+                logger.warning("Planner weekly 含未提供的真题号，跳过本批理由")
+                continue
+            for item in obj.get("weeks") or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    w_no = int(item.get("week"))
+                except (TypeError, ValueError):
+                    continue
+                reason = str(item.get("reason") or "").strip()
+                if reason:
+                    out[w_no] = reason[:80]
+        return out or None
 
     def _enrich_guide(
         self, plan: dict[str, Any], challenges: list[Challenge] | None
@@ -178,12 +292,14 @@ class Planner:
             "1. 不得改变阶段、日期、小时、考点、真题编号；",
             "2. 不得推荐任何教材、网课、老师、参考书；",
             "3. 只写方法：怎么理解、怎么刷题、怎么归因、怎么复盘；",
-            "4. overview 150–250 字；每条 advice/strategy 60–120 字；",
-            "5. 严格输出 JSON："
+            "4. overview 120–180 字；分段建议 50–90 字；分科策略用第一人称、连贯成段；",
+            "5. 不要输出 sources，资料清单由模板保留；",
+            "6. 严格输出 JSON："
             '{"overview":"...","phase_advice":[{"stage":"...","advice":"..."}],'
             '"subject_order":"...",'
-            '"subject_strategy":[{"subject":"...","strategy":"...","pitfalls":["..."]}],'
-            '"weekly_routine":"...","pitfalls":["..."],"checkpoints":["..."]}',
+            '"subject_strategy":[{"subject":"...","strategy":"..."}],'
+            '"weekly_routine":"...","paper_usage":"...","review_workflow":"...",'
+            '"pacing":"...","expectation":"...","crunch":"...","note":"..."}',
         ]
         if challenges:
             high_msgs = []
@@ -205,7 +321,7 @@ class Planner:
             },
             {"role": "user", "content": "\n".join(user)},
         ]
-        resp = self.guide_llm.chat(messages, max_tokens=2200, json_mode=True)
+        resp = self.guide_llm.chat(messages, max_tokens=4000, json_mode=True)
         if not resp.ok:
             logger.warning(f"Planner guide 调用失败，使用模板：{resp.error[:120]}")
             return None
@@ -228,8 +344,13 @@ class Planner:
             "subject_order",
             "subject_strategy",
             "weekly_routine",
-            "pitfalls",
-            "checkpoints",
+            "paper_usage",
+            "review_workflow",
+            "pacing",
+            "expectation",
+            "crunch",
+            "note",
+            "sources",
         ):
             if key not in obj or not obj[key]:
                 obj[key] = template.get(key)
@@ -291,7 +412,7 @@ class Critic:
                 ),
             },
         ]
-        resp = self.llm.chat(messages, max_tokens=1400, json_mode=True)
+        resp = self.llm.chat(messages, max_tokens=4000, json_mode=True, timeout=120)
         if not resp.ok:
             return [], False
         obj = _extract_json(resp.text) or {}
@@ -347,7 +468,7 @@ class Expert:
                 ),
             },
         ]
-        resp = self.llm.chat(messages, max_tokens=800, json_mode=True)
+        resp = self.llm.chat(messages, max_tokens=4000, json_mode=True, timeout=120)
         if not resp.ok:
             return []
         obj = _extract_json(resp.text) or {}

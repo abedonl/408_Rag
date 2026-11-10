@@ -9,8 +9,12 @@
 并附带完整的消融实验与考点分析能力。交叉编码器重排经消融验证为负收益，未启用。
 
 > **状态**：一期（检索 + 生成 + 服务 + 消融）、二期（Agent 编排 + 考点分析 +
-> 图表解析）、三期（对抗 Plan）均已完成。最新 Agent 三路径评测见
-> 「LLM-only / 单轮 RAG / Agent」。
+> 图表解析）、三期（对抗 Plan）、四期（用户画像闭环 + HITL 人工裁定）均已完成；
+> 随后做了**中枢化整合**：规划/画像/判分封装为 Agent 工具，聊天入口即可调用；
+> UI 收敛为**单页 Agent 中枢**——聊天是唯一主入口，规划看板与考点图表
+> 内嵌会话流与对话联动（聊天生成规划后，看板钉在会话流末尾；考情回答内嵌
+> 频次/题型图表），单轮问答下线
+>（其价值是消融对照，演示走 API / 评测脚本）。
 
 ---
 
@@ -26,7 +30,7 @@
 | held-out（2023–2026，99 题） | Accuracy@10 **0.687**，P50 54ms |
 | Agent 三路径（dev 21 题） | 纯 LLM 90.5% / 单轮 85.7% / Agent **95.2%**；空回答 0%（小样本，CI 下界 0） |
 | Agent 对抗 Plan 规则 | 黄金 Plan **0 误报**；6 类注入 **40/40 检出** |
-| 测试 | **135 passed**（数据相关测试需本地题库） |
+| 测试 | **267 passed**（数据相关测试需本地题库） |
 
 **架构**
 
@@ -42,8 +46,9 @@
                        │
         ┌──────────────┼──────────────────┐
         ▼              ▼                  ▼
-     单轮 RAG      Agent（9 工具）     对抗性 Plan
+     单轮 RAG      Agent（13 工具）    对抗性 Plan
                   计算器/图解析/考点    规则质疑 + LLM 文案
+                  + 规划/画像/判分
 ```
 
 **60 秒跑起来**
@@ -55,8 +60,9 @@ uv sync
 streamlit run app/streamlit_app.py
 ```
 
-首次构建索引见「快速开始 → 首次构建数据」。不想配 LLM 时，打开「🛡 对抗规划」，
-保持「启用 LLM 文案」关闭，点击「生成并质疑」即可看到完整 Plan（约 0.5s）。
+首次构建索引见「快速开始 → 首次构建数据」。不想配 LLM 时，直接在聊天里说
+「帮我规划复习」，「📅 我的规划执行」看板随即出现在会话流末尾（约 0.5s）；
+展开看板里的「🛠 调整条件，重新生成规划」可改条件重生成（保持「启用 LLM 文案」关闭即可）。
 
 ![对抗规划 demo](docs/demo.png)
 
@@ -71,6 +77,7 @@ streamlit run app/streamlit_app.py
 
 - **想跑起来** → 快速开始（一键脚本 / 手动命令 / 首次构建数据）
 - **想看数字** → 实验数据 → held-out 报告 → 二期 Agent → 三期对抗 Plan
+- **想看闭环** → 四期：用户画像闭环与人工裁定（HITL）
 - **想看为什么** → 检索融合与排序：进一步实验 → 评测口径
 - **想看边界** → 已知问题与优化记录（含负结果和空正文排查）
 
@@ -408,11 +415,11 @@ held-out 的真题解析**从未入库**，检索时也被 `year_allowed` 二次
 （dense+sparse+BM25、zscore、节去重）成为 Agent 手上的一个工具，
 一期的消融结论因此依然成立。
 
-### 九个工具
+### 十三个工具
 
 | 工具 | 触发条件 | 职责 | 数据来源 |
 |---|---|---|---|
-| `search_knowledge_base` | 所有路线先检索 | 复用一期三路混合检索 | Qdrant 5296 chunk |
+| `search_knowledge_base` | 所有问答路线先检索 | 复用一期三路混合检索 | Qdrant 5296 chunk |
 | `search_knowledge_graph` | 概念/跨科目且有关键词 | 知识点层级、同节兄弟、章节路径 | Neo4j 6182 节点 |
 | `read_figure` | `route=figure` 且 qid 有图 | 分层图解（T1 SVG 重建 → T2 文本 → T3 视觉） | 72 道题的题干 SVG |
 | `calculate` | `route=calc` 且模型给出算式 | AST 白名单沙箱求值，禁止任意代码 | — |
@@ -421,6 +428,16 @@ held-out 的真题解析**从未入库**，检索时也被 `year_allowed` 二次
 | `get_related_kps` | `route=exam` | 真题共现 + 图谱同节/祖先 | 720 tags + Neo4j |
 | `get_learning_path` | `route=exam` 且问「先学/前置」 | 前置学习链（沿 PREREQUISITE 反向） | Neo4j 148 条前置边 |
 | `verify_answer` | 每次回答的最后一步 | 引用编号、真题编号、押题表述校验 | — |
+| `generate_plan` | `route=plan` 且问「规划/计划/安排」 | 生成个性化规划，自动读画像加权 | planner + 画像 |
+| `read_profile` | `route=plan` 第一站 | 画像摘要：提问/作答/加权考点 | SQLite 事件流 |
+| `record_checkin` | 保留契约（UI 不再暴露） | 记录周任务打卡，latest-wins 聚合 | SQLite |
+| `judge_quiz` | 用户报作答（写） | 判分：答错进错题本、答对移出，同步画像 | 720 真题答案 |
+
+后四个是**中枢工具**（中枢化整合）：规划、画像、判分从独立 tab 能力
+变成 Agent 可调用的工具。两个写工具在契约里标记 `idempotent=False`——
+即使配了 retries 也绝不自动重试（写操作重试会产生重复事件）；
+`client_id` 不在任何工具的参数模型里，只能由调用方绑定，LLM 无法冒充别人。
+plan 路由的回答由确定性模板成文（数字全部来自工具输出），无 LLM key 也能用。
 
 ### 状态机
 
@@ -438,7 +455,7 @@ flowchart TD
     V --> OUT[返回 steps / tool_calls / verification]
 ```
 
-`route` 用规则判定（概念 / 计算 / 图表 / 考点咨询），不调 LLM；
+`route` 用规则判定（概念 / 计算 / 图表 / 考点咨询 / 备考中枢），不调 LLM；
 `assess` 最多重试 1 次（共 2 轮检索），计算/图表/考点题直接走 `act`。
 每一步都写入 trace，供 `/v1/agent/query` 与前端展示。
 
@@ -483,10 +500,10 @@ verify   引用 [1]；无押题表述
 |---|---|
 | `agent/graph.py` | route → retrieve → assess → act → answer → verify 的 LangGraph 定义 |
 | `agent/nodes.py` | 规则路由、`_propose_expression`、answer、verify |
-| `agent/tools.py` | 9 个工具的实现与 trace |
+| `agent/tools.py` | 13 个工具的实现与 trace |
 | `agent/exam_analysis.py` | 真题频次 / 题型 / 关联统计 |
 | `eval/agent_eval.py` | LLM-only / 单轮 / Agent 三路径与 bootstrap CI |
-| `app/streamlit_app.py` | 「🤖 Agent 备考助手」tab 展示 steps / tool_calls / verification |
+| `app/streamlit_app.py` | 单页 Agent 中枢聊天区展示 steps / tool_calls / verification |
 
 ### 为什么不是 ReAct
 
@@ -612,7 +629,7 @@ T1 只能给结构（树高、连接关系），不能给节点值。需要节�
 | 图表 | 8 | 检索 + 图解析 | 2.0 | 25% | 62% | 59.6s | 16.5s | **3.6×** |
 | 跨科目 | 1 | 概念路径 | 2.0 | 100% | 0% | 12.7s | 6.8s | 1.9× |
 
-这张表比「有 9 个工具」更能说明设计意图：
+这张表比「有 13 个工具」更能说明设计意图：
 
 - **概念题 1.0× 延迟、持平**：路由没有对简单题施加额外开销，这是有意的。
 - **计算题 2.2×、反而更低**：计算器路径要多一次 LLM 产出算式，
@@ -892,7 +909,7 @@ python -m cs408rag.eval.adversarial_eval --limit 1
 # 单测
 python -m pytest tests/test_adversarial.py -q
 
-# 前端：打开「🛡 对抗规划」
+# 前端：单页 Agent 中枢（聊天生成规划后，会话流末尾出现「📅 我的规划执行」看板）
 streamlit run app/streamlit_app.py
 ```
 
@@ -909,6 +926,45 @@ streamlit run app/streamlit_app.py
    这些词，会退回模板。
 7. **结构 Plan 不依赖 LLM**：LLM 只润色 guide；它的失败不会让 Plan 缺失，
    但也不会改变阶段、小时、考点和真题号。
+
+## 四期：用户画像闭环与人工裁定（HITL）
+
+三期把 Plan 做「对」，四期把 Plan 做「懂你」：用户的行为数据回流到规划，
+规划再反作用到下一次规划，形成一个可观测的闭环。
+
+**闭环链路**
+
+```text
+提问 / 作答判分 ──→ 画像事件（SQLite，事件溯源）
+                        │
+              读取时聚合：高频考点 / 答错考点
+                        │
+                        ▼
+        对抗规划 boost_tags（优先级：答错 > 高频 > 规划重点）
+                        │
+        生成 Plan → HITL 人工裁定（采纳则修订一版）
+                        │
+                        ▼
+        侧栏「学习总结」：LLM 按近 7/30 天事件自动生成学习情况
+```
+
+- **画像 = 事件的派生视图**：SQLite 只存事件（question / plan / quiz），
+  画像是读取时聚合出来的，单一事实来源；plan 事件 30 天过期，
+  避免旧规划永久影响加权。
+- **纯规则考点提取，不调 LLM**：整标签子串命中 > 最长公共片段（≥3 字）>
+  2 字片段兜底（限 2 个）。226 个标签扫一遍是毫秒级，可解释、可复现、零成本——
+  这是刻意取舍，不是偷懒。
+- **作答判分入错题本**：推荐真题卡片上直接作答，接 judge API；答错进错题本
+  （wrong_count 累加）、答对自动移出，同时记 quiz 事件——答错考点是加权
+  优先级最高的薄弱信号。
+- **HITL 只做一处**：6 类规则挑战是纯函数判定（有客观对错，人介入无增量）；
+  只有 LLM 主观挑战缺裁判，交给用户勾选「采纳 / 忽略」。采纳则以当前快照为
+  起点喂回 planner 修订恰好一版；忽略则进入封闭集不再提出。
+- **学习总结（自动）**：侧栏按近 7 天 / 近 30 天窗口，用 LLM 基于事件生成
+  「覆盖情况 / 薄弱信号 / 下一步建议」，用户无需操作，每 30 分钟更新；
+  无 LLM key 时降级为统计摘要。
+- **匿名身份**：`?cid=` 查询参数区分用户，无账号系统——demo 取舍，画像里
+  没有隐私数据。
 
 ## 检索融合与排序：进一步实验
 
@@ -1326,22 +1382,27 @@ src/cs408rag/
 ├── api/                 # FastAPI 服务层（含 /v1/agent/* 与 /v1/exam/*）
 ├── eval/                # 检索消融 + Agent 对比 + 考点结论质量 + 对抗 Plan 评测
 ├── adversarial/         # 对抗性 Plan：规则引擎 + 三角色状态机 + 注入数据集
-│   ├── graph.py         # LangGraph 状态机（plan_gen → rule_guard → critic → advance）
-│   ├── planner.py       # 日期/阶段/科目份额/详细 Plan/经验贴模板
+│   ├── graph.py         # LangGraph 状态机（plan_gen → rule_guard → critic → advance；iter_resume 人工修订）
+│   ├── planner.py       # 日期/阶段/科目份额/详细 Plan/经验贴模板/画像加权
 │   ├── roi.py           # 高性价比考点：频次/近年/题型/学习成本
 │   ├── rules.py         # 6 类可验证规则，纯函数
 │   ├── roles.py         # Planner / Critic / Expert，各自独立模型与权限
 │   ├── schema.py        # Plan 校验、摘要、两版 diff
 │   └── dataset.py       # 黄金 Plan + 注入错误数据集
-└── agent/               # LangGraph 编排、九个工具、考点分析
-    ├── graph.py         # 状态机与运行入口
+├── profile/             # 用户画像：SQLite 事件溯源（question/plan/quiz）+ 会话持久化
+│   ├── store.py         # 事件 + conversations/messages 表；单连接 + 锁
+│   └── stats.py         # 读取时聚合：高频/答错 → boost_tags；plan 30 天过期
+├── notebook/            # 错题本：judge 判分（答错入本、答对移出）
+├── observability.py     # 后台留档：检索 trace 与消融 → Markdown / /v1/traces
+└── agent/               # LangGraph 编排、十三个工具、考点分析
+    ├── graph.py         # 状态机与运行入口（plan 路由跳过检索，直进工具循环）
     ├── nodes.py         # route / retrieve / assess / act / answer / verify
-    ├── tools.py         # 九个工具
+    ├── tools.py         # 十三个工具（含规划/画像/判分中枢工具）
     ├── calculator.py    # AST 白名单沙箱
     └── exam_analysis.py # 真题考点统计（多标签聚合）
 
-app/streamlit_app.py     # 6 个 tab：问答 / Agent / 检索调试 / 考点 / 实验数据 / 对抗规划
-tests/                   # 135 个测试；CI 只跑不依赖数据的 10 个纯函数单测
+app/streamlit_app.py     # 单页 Agent 中枢：聊天 + 会话列表 + 会话内嵌规划看板/考点图表 + 侧栏学习总结
+tests/                   # 267 个测试；CI 只跑不依赖数据的纯函数单测
 scripts/                 # start.sh / stop.sh / 模型基准 / 数据与镜像脚本
 .github/workflows/ci.yml # ruff + 纯函数单测
 ```

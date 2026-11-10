@@ -318,6 +318,30 @@ class TestPlanner:
         )
         assert os_hours / total >= 0.60
 
+    def test_weekly_tasks_differ_within_phase(self):
+        """同一阶段的每周任务必须有差异：真题分年份区间、冲刺分模考套数。
+
+        否则周计划表会整段重复，用户看到「怎么都一样」。
+        """
+        from cs408rag.adversarial.planner import build_detailed_plan
+
+        p = build_detailed_plan(self._goal())
+        drill: dict[str, list[str]] = {}
+        mock: dict[str, list[str]] = {}
+        for w in p["weekly_plan"]:
+            stage = w.get("stage")
+            for t in w["tasks"]:
+                if stage == "真题":
+                    drill.setdefault(t["subject"], []).append(t["content"])
+                elif stage == "冲刺":
+                    mock.setdefault(t["subject"], []).append(t["content"])
+        for subject, contents in drill.items():
+            if len(contents) > 1:
+                assert len(set(contents)) == len(contents), (subject, contents)
+        for subject, contents in mock.items():
+            if len(contents) > 1:
+                assert len(set(contents)) == len(contents), (subject, contents)
+
     def test_concern_routing_changes_plan(self):
         from cs408rag.adversarial.planner import build_detailed_plan
 
